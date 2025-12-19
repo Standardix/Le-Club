@@ -2,263 +2,702 @@ import io
 import re
 import math
 import pandas as pd
+import openpyxl
 from slugify import slugify
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
-SHOPIFY_COLUMNS = [
+YELLOW_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+# ---------------------------------------------------------
+# ORDRE FINAL DES COLONNES (strict)
+# ---------------------------------------------------------
+SHOPIFY_OUTPUT_COLUMNS = [
     "Handle",
     "Command",
     "Title",
     "Body (HTML)",
     "Vendor",
-    "Category: ID",
-    "Variant Option1 Name",
-    "Variant Option1 Value",
-    "Variant Option2 Name",
-    "Variant Option2 Value",
-    "Variant Price",
+    "Custom Product Type",
+    "Tags",
+    "Published",
+    "Published Scope",
+    "Option1 Name",
+    "Option1 Value",
     "Variant SKU",
     "Variant Barcode",
-    "Variant Inventory Qty",
-    "Country of Origin",
-    "HS Code",
+    "Variant Country of Origin",
+    "Variant HS Code",
+    "Variant Grams",
+    "Variant Inventory Tracker",
+    "Variant Inventory Policy",
+    "Variant Fulfillment Service",
+    "Variant Price",
+    "Variant Requires Shipping",
+    "Variant Taxable",
+    "SEO Title",
+    "SEO Description",
+    "Variant Weight Unit",
+    "Cost per item",
+    "Status",
+    "Metafield: my_fields.product_use_case [multi_line_text_field]",
+    "Metafield: my_fields.product_features [multi_line_text_field]",
+    "Metafield: my_fields.behind_the_brand [multi_line_text_field]",
+    "Metafield: my_fields.size_comment [single_line_text_field]",
+    "Metafield: my_fields.gender [single_line_text_field]",
+    "Metafield: my_fields.colour [single_line_text_field]",
+    "Metafield: mm-google-shopping.color",
+    "Variant Metafield: mm-google-shopping.size",
+    "Metafield: mm-google-shopping.size_system",
+    "Metafield: mm-google-shopping.condition",
     "Metafield: mm-google-shopping.google_product_category",
+    "Metafield: mm-google-shopping.gender",
+    "Variant Metafield: mm-google-shopping.mpn",
+    "Variant Metafield: mm-google-shopping.gtin",
+    "Metafield: theme.siblings [single_line_text_field]",
+    "Category: ID",
+    "Inventory Available: Boutique",
+    "Inventory Available: Le Club",
 ]
 
-# ---------- HELP DATA ----------
-def _read_2col_sheet(help_bytes: bytes, sheet_name: str) -> pd.DataFrame | None:
-    """
-    Lit 2 colonnes:
-      Col A = keyword exact (pour matching)
-      Col B = valeur à retourner (ICI: nom de catégorie, puisque tu veux le nom et non le numéro)
-    """
-    try:
-        df = pd.read_excel(io.BytesIO(help_bytes), sheet_name=sheet_name, header=None, dtype=str)
-        df = df.dropna(how="all")
-        if df.shape[1] < 2:
-            return None
-        df = df.iloc[:, :2].copy()
-        df.columns = ["key", "value"]
-        df["key"] = df["key"].astype(str).str.strip()
-        df["value"] = df["value"].astype(str).str.strip()
-        return df
-    except Exception:
-        return None
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+def _norm(s) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip())
 
-def _build_map(help_bytes: bytes, sheet_name: str) -> dict[str, str]:
-    df = _read_2col_sheet(help_bytes, sheet_name)
-    if df is None:
+
+def _strip_reg_for_handle(s: str) -> str:
+    """Handle only: remove ® and (r)/[r] to keep URL safe."""
+    t = _norm(s)
+    t = t.replace("®", "")
+    t = re.sub(r"[\(\[\{]\s*r\s*[\)\]\}]", "", t, flags=re.IGNORECASE)
+    return _norm(t)
+
+
+def _convert_r_to_registered(s: str) -> str:
+    """Display/SEO: convert (r)/[r] to ®."""
+    t = _norm(s)
+    t = re.sub(r"[\(\[\{]\s*r\s*[\)\]\}]", "®", t, flags=re.IGNORECASE)
+    return t
+
+
+def _words(s: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(s).lower())
+
+
+def _singularize_token(tok: str) -> str:
+    # basic: hats -> hat (only for longer tokens)
+    if tok.endswith("s") and len(tok) >= 4:
+        return tok[:-1]
+    return tok
+
+
+def _wordset_loose(s: str) -> set[str]:
+    return set(_singularize_token(t) for t in _words(s))
+
+
+def _first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in cols:
+            return cols[c.lower()]
+    return None
+
+
+# ---------------------------------------------------------
+# Help data readers (openpyxl)
+# ---------------------------------------------------------
+def _load_help_wb(help_bytes: bytes):
+    return openpyxl.load_workbook(io.BytesIO(help_bytes), data_only=True)
+
+
+def _read_2col_map(wb, sheet_candidates: list[str]) -> dict[str, str]:
+    """Col A raw -> Col B standard"""
+    sheet = None
+    for name in sheet_candidates:
+        if name in wb.sheetnames:
+            sheet = wb[name]
+            break
+    if sheet is None:
         return {}
-    return {str(k).strip().lower(): str(v).strip() for k, v in zip(df["key"], df["value"])}
 
-def _standardize(val, mapping: dict[str, str]) -> str:
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return ""
-    s = str(val).strip()
-    if s == "":
+    m: dict[str, str] = {}
+    for r in range(2, sheet.max_row + 1):
+        a = sheet.cell(row=r, column=1).value
+        b = sheet.cell(row=r, column=2).value
+        if a is None or b is None:
+            continue
+        ra = str(a).strip()
+        rb = str(b).strip()
+        if not ra or ra.lower() == "nan":
+            continue
+        m[ra.lower()] = rb
+    return m
+
+
+def _standardize(val: str, mapping: dict[str, str]) -> str:
+    s = _norm(val)
+    if not s or s.lower() == "nan":
         return ""
     return mapping.get(s.lower(), s)
 
-# ---------- FALLBACK COLOR / SIZE ----------
-def _extract_color_size(description: str) -> tuple[str, str]:
-    """
-    Fallback MVP:
-    Essaie de lire des patterns simples en fin de description:
-      "... - COLOR - SIZE" / "... , COLOR , SIZE" / "... / COLOR / SIZE"
-    """
-    if not description:
-        return "", ""
-    text = str(description).strip()
 
+def _read_list_column(wb, sheet_name: str) -> list[str]:
+    if sheet_name not in wb.sheetnames:
+        return []
+    ws = wb[sheet_name]
+    out = []
+    for r in range(2, ws.max_row + 1):
+        v = ws.cell(row=r, column=1).value
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and s.lower() != "nan":
+            out.append(s)
+    return out
+
+
+def _read_category_rows(wb, sheet_name: str):
+    """returns list[(name_keywords, id)] from columns A,B"""
+    if sheet_name not in wb.sheetnames:
+        return None
+    ws = wb[sheet_name]
+    rows = []
+    for r in range(2, ws.max_row + 1):
+        a = ws.cell(row=r, column=1).value
+        b = ws.cell(row=r, column=2).value
+        if a is None:
+            continue
+        aa = str(a).strip()
+        bb = "" if b is None else str(b).strip()
+        if aa and aa.lower() != "nan":
+            rows.append((aa, bb))
+    return rows or None
+
+
+def _read_brand_line_map(wb, sheet_name: str) -> dict[str, str]:
+    """
+    Col A = brand
+    Col B+ = text parts (concatenated)
+    """
+    if sheet_name not in wb.sheetnames:
+        return {}
+    ws = wb[sheet_name]
+    m = {}
+    for r in range(2, ws.max_row + 1):
+        brand = ws.cell(row=r, column=1).value
+        if brand is None:
+            continue
+        b = str(brand).strip()
+        if not b or b.lower() == "nan":
+            continue
+
+        parts = []
+        for c in range(2, ws.max_column + 1):
+            v = ws.cell(row=r, column=c).value
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s and s.lower() != "nan":
+                parts.append(s)
+
+        if parts:
+            m[b.lower()] = " ".join(parts).strip()
+    return m
+
+
+def _read_size_reco_map(wb) -> dict[str, str]:
+    """Garment -> Comment"""
+    if "Size Recommandation" not in wb.sheetnames:
+        return {}
+    ws = wb["Size Recommandation"]
+
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        h = ws.cell(row=1, column=c).value
+        if h is None:
+            continue
+        headers[str(h).strip().lower()] = c
+
+    gcol = headers.get("garment")
+    ccol = headers.get("comment")
+    if not gcol or not ccol:
+        return {}
+
+    m = {}
+    for r in range(2, ws.max_row + 1):
+        g = ws.cell(row=r, column=gcol).value
+        c = ws.cell(row=r, column=ccol).value
+        if g is None or c is None:
+            continue
+        gs = str(g).strip()
+        cs = str(c).strip()
+        if gs and cs:
+            m[gs.lower()] = cs
+    return m
+
+
+# ---------------------------------------------------------
+# Matching functions
+# ---------------------------------------------------------
+def _best_match_id(text: str, cat_rows) -> str:
+    """
+    Exact-match (loose singular/plural): all words in name must be in text.
+    Returns ID (col B).
+    """
+    if not cat_rows:
+        return ""
+    tset = _wordset_loose(text)
+    best_id = ""
+    best_len = 0
+    for name, cid in cat_rows:
+        nset = _wordset_loose(name)
+        if nset and nset.issubset(tset):
+            if len(nset) > best_len:
+                best_len = len(nset)
+                best_id = str(cid or "").strip()
+    best_id = re.sub(r"\.0$", "", best_id) if best_id else ""
+    return best_id
+
+
+def _best_match_product_type(text: str, product_types: list[str]) -> str:
+    tset = _wordset_loose(text)
+    best = ""
+    best_len = 0
+    for pt in product_types:
+        pset = _wordset_loose(pt)
+        if pset and pset.issubset(tset):
+            if len(pset) > best_len:
+                best_len = len(pset)
+                best = pt
+    return best
+
+
+# ---------------------------------------------------------
+# Parsing & formatting
+# ---------------------------------------------------------
+def _extract_color_size_from_description(desc: str) -> tuple[str, str]:
+    text = _norm(desc)
+    if not text:
+        return "", ""
     parts = re.split(r"\s*[-,/]\s*|\s*,\s*", text)
     parts = [p.strip() for p in parts if p and p.strip()]
+    if len(parts) < 2:
+        return "", ""
+    last = parts[-1]
+    if re.fullmatch(r"(X{0,3}S|X{0,3}L|S|M|L|XL|XXL|XXXL|\d{1,2}([./-]\d{1,2})?)", last, flags=re.IGNORECASE):
+        return parts[-2], last
+    return parts[-1], ""
 
-    color, size = "", ""
-    if len(parts) >= 2:
-        last = parts[-1]
-        # heuristique size
-        if re.fullmatch(r"(X{0,3}S|X{0,3}L|S|M|L|XL|XXL|XXXL|\d{1,2}([./-]\d{1,2})?)", last, flags=re.IGNORECASE):
-            size = last
-            color = parts[-2]
-        else:
-            color = parts[-1]
 
-    return color, size
-
-# ---------- CATEGORY MATCH ----------
-def _words(s: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", str(s).lower()))
-
-def _best_keyword_match_value(description: str, keyword_value_df: pd.DataFrame | None) -> str:
-    """
-    Exact match: tous les mots du keyword (col A) doivent être présents dans la description.
-    Retourne la valeur col B (ICI: NOM de catégorie).
-    Choisit le match le plus spécifique (le plus de mots).
-    """
-    if keyword_value_df is None:
-        return ""
-
-    desc_words = _words(description)
-    best_value = ""
-    best_len = 0
-
-    for _, row in keyword_value_df.iterrows():
-        kw = str(row["key"]).strip()
-        kw_words = _words(kw)
-        if not kw_words:
-            continue
-        if kw_words.issubset(desc_words):
-            if len(kw_words) > best_len:
-                best_len = len(kw_words)
-                best_value = str(row["value"]).strip()
-
-    return best_value
-
-# ---------- PRICE ----------
 def _round_to_nearest_9_99(price) -> float:
     if price is None or (isinstance(price, float) and math.isnan(price)):
         return float("nan")
     p = float(price)
-    nearest10 = math.floor(p / 10.0 + 0.5) * 10.0  # half-up
+    nearest10 = math.floor(p / 10.0 + 0.5) * 10.0
     return round(nearest10 - 0.01, 2)
 
-# ---------- BARCODE ----------
-def _clean_barcode_keep_leading_zeros(x) -> str:
-    """
-    - Si Excel a converti en nombre: enlève .0, convertit en int, puis zfill(12) si <= 12 digits.
-    - Si c'est déjà du texte: on conserve tel quel (en enlevant espaces).
-    """
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return ""
 
+def _barcode_keep_zeros(x) -> str:
+    if x is None:
+        return ""
     s = str(x).strip()
-    if s == "":
+    if s == "" or s.lower() == "nan":
         return ""
-
-    # cas "12345.0"
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
-
-    # si uniquement digits, padding UPC-A 12 digits si plus court
     if re.fullmatch(r"\d+", s):
-        if len(s) <= 12:
-            return s.zfill(12)
-        return s
-
-    # sinon, on retourne tel quel (au cas où GTIN avec lettres/format)
+        return s.zfill(12) if len(s) <= 12 else s
     return s
 
-# ---------- MAIN ----------
-def run_transform(supplier_xlsx_bytes: bytes, help_xlsx_bytes: bytes, vendor_name: str):
-    # Lire supplier en mode "texte" pour éviter pertes (UPC, HTS, etc.)
-    df = pd.read_excel(io.BytesIO(supplier_xlsx_bytes), sheet_name=0, dtype=str).copy()
 
+def _hs_code_clean(x) -> str:
+    """Do not append zeros; only clean Excel .0 artifact."""
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s == "" or s.lower() == "nan":
+        return ""
+    return re.sub(r"\.0$", "", s)
+
+
+def _title_case_preserve_registered(text: str) -> str:
+    """Title Case while preserving ®."""
+    text = _norm(text)
+    if not text:
+        return ""
+    parts = text.split(" ")
+    out = []
+    for w in parts:
+        if "®" in w:
+            sub = w.split("®")
+            sub = [p[:1].upper() + p[1:].lower() if p else "" for p in sub]
+            out.append("®".join(sub))
+            continue
+        if w.isupper() and len(w) <= 4:
+            out.append(w)
+            continue
+        if any(ch.isdigit() for ch in w):
+            out.append(w)
+            continue
+        out.append(w[:1].upper() + w[1:].lower() if w else w)
+    return " ".join(out)
+
+
+# ---------------------------------------------------------
+# Excel highlighting
+# ---------------------------------------------------------
+def _apply_yellow_for_empty(buffer: io.BytesIO, sheet_name: str, cols_to_yellow: list[str]) -> io.BytesIO:
+    buffer.seek(0)
+    wb = load_workbook(buffer)
+    ws = wb[sheet_name]
+
+    header = [cell.value for cell in ws[1]]
+    col_index = {name: i + 1 for i, name in enumerate(header) if name}
+
+    for col_name in cols_to_yellow:
+        if col_name not in col_index:
+            continue
+        c = col_index[col_name]
+        for r in range(2, ws.max_row + 1):
+            cell = ws.cell(row=r, column=c)
+            val = cell.value
+            if val is None or (isinstance(val, str) and val.strip() == ""):
+                cell.fill = YELLOW_FILL
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+def run_transform(
+    supplier_xlsx_bytes: bytes,
+    help_xlsx_bytes: bytes,
+    vendor_name: str,
+    brand_choice: str = "",
+):
+    sup = pd.read_excel(io.BytesIO(supplier_xlsx_bytes), sheet_name=0, dtype=str).copy()
     warnings: list[dict] = []
 
-    # Help data (noms d'onglets maintenant OK chez toi)
-    color_map = _build_map(help_xlsx_bytes, "Color Standardization")
-    size_map = _build_map(help_xlsx_bytes, "Size Standardization")
-    country_map = _build_map(help_xlsx_bytes, "Country Abbreviations")
+    wb = _load_help_wb(help_xlsx_bytes)
 
-    google_cat = _read_2col_sheet(help_xlsx_bytes, "Google Product Category")   # keyword -> NOM catégorie
-    shopify_cat = _read_2col_sheet(help_xlsx_bytes, "Shopify Product Category") # keyword -> NOM catégorie
+    # Standardization
+    color_map = _read_2col_map(wb, ["Color Standardization", "Color Variable"])
+    size_map = _read_2col_map(wb, ["Size Standardization", "Size Variante"])
+    country_map = _read_2col_map(wb, ["Country Abbreviations", "Country of Origin"])
+    gender_map = _read_2col_map(wb, ["Gender Standardization", "Gender"])
 
-    # Colonnes requises minimales (Color/Size optionnelles)
-    required = ["Product", "Description", "Qty", "Cad MSRP", "UPC", "Origin", "HTS Code"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Colonnes manquantes dans le fichier fournisseur: {missing}")
+    # Categories & Product types
+    shopify_cat_rows = _read_category_rows(wb, "Shopify Product Category")
+    google_cat_rows = _read_category_rows(wb, "Google Product Category")
+    product_types = _read_list_column(wb, "Product Types")
 
-    # S'assurer que Color/Size existent
-    if "Color" not in df.columns:
-        df["Color"] = ""
-    if "Size" not in df.columns:
-        df["Size"] = ""
+    # Brand maps
+    brand_desc_map = _read_brand_line_map(wb, "SEO Description Brand Part")
+    brand_lines_map = _read_brand_line_map(wb, "Brand lines")
 
-    # Convertir MSRP en numérique pour arrondi
-    df["Cad MSRP_num"] = pd.to_numeric(df["Cad MSRP"].str.replace("$", "", regex=False).str.replace(",", "", regex=False), errors="coerce")
+    # Size reco
+    size_comment_map = _read_size_reco_map(wb)
 
-    # Fallback Color/Size depuis Description si vides
-    for i, r in df.iterrows():
-        color = (r.get("Color") or "").strip()
-        size = (r.get("Size") or "").strip()
-        if color == "" or size == "":
-            fb_color, fb_size = _extract_color_size(r.get("Description", ""))
-            if color == "" and fb_color:
-                df.at[i, "Color"] = fb_color
-            if size == "" and fb_size:
-                df.at[i, "Size"] = fb_size
+    # -------------------------
+    # Supplier columns (UPDATED)
+    # -------------------------
+    # (1) add "Display Name" as a candidate for description
+    desc_col = _first_existing_col(
+        sup,
+        ["description", "Display Name", "product name", "Title", "Product Name", "title"],
+    )
 
-    # Standardisation
-    df["Color"] = df["Color"].apply(lambda x: _standardize(x, color_map))
-    df["Size"] = df["Size"].apply(lambda x: _standardize(x, size_map))
-    df["Origin"] = df["Origin"].apply(lambda x: _standardize(x, country_map))
+    product_col = _first_existing_col(sup, ["Product", "Product Code", "SKU", "sku"])
 
-    # Title = Description + Color
-    df["Title"] = (df["Description"].fillna("").astype(str).str.strip() + " " + df["Color"].fillna("").astype(str).str.strip()).str.strip()
+    # (4) add "Vendor Color" as a candidate
+    color_col = _first_existing_col(sup, ["Vendor Color", "Color", "Colour", "vendor color", "color", "colour"])
 
-    # Handle = Vendor + Description + Color
-    df["Handle"] = df.apply(lambda r: slugify(f"{vendor_name} {r['Description']} {r['Color']}".strip()), axis=1)
+    # (2)(5) add "Vendor Size1" as a candidate
+    size_col = _first_existing_col(sup, ["Vendor Size1", "Size", "vendor size1", "size"])
 
-    # Price rounding x9.99
-    df["Variant Price"] = df["Cad MSRP_num"].apply(_round_to_nearest_9_99)
+    upc_col = _first_existing_col(sup, ["UPC", "UPC Code", "upc", "upc code"])
+    origin_col = _first_existing_col(sup, ["Country Code", "Origin", "Manufacturing Country"])
+    hs_col = _first_existing_col(sup, ["HS Code", "HTS Code"])
+    extid_col = _first_existing_col(sup, ["External ID", "ExternalID"])
+    msrp_col = _first_existing_col(sup, ["Cad MSRP", "MSRP"])
+    landed_col = _first_existing_col(sup, ["Landed"])
+    grams_col = _first_existing_col(sup, ["Grams", "Weight (g)", "Weight"])
+    gender_col = _first_existing_col(sup, ["Gender"])
 
-    # Barcode keep leading zeros
-    df["Variant Barcode"] = df["UPC"].apply(_clean_barcode_keep_leading_zeros)
+    if desc_col is None:
+        raise ValueError(
+            'Aucune colonne Description trouvée. Colonnes acceptées: "description", "Display Name", "product name", "Title".'
+        )
+    if msrp_col is None:
+        raise ValueError('Colonne "Cad MSRP" / "MSRP" introuvable dans le fichier fournisseur.')
 
-    # Category names (NOT numbers) via exact match
-    df["Google Category Name"] = df["Description"].apply(lambda d: _best_keyword_match_value(d, google_cat))
-    df["Shopify Category Name"] = df["Description"].apply(lambda d: _best_keyword_match_value(d, shopify_cat))
+    # Base description
+    sup["_desc_raw"] = sup[desc_col].astype(str).fillna("").map(_norm)
+    sup["_desc_seo"] = sup["_desc_raw"].apply(_convert_r_to_registered)
+    sup["_desc_handle"] = sup["_desc_raw"].apply(_strip_reg_for_handle)
 
-    # Warnings utiles
-    for i, r in df.iterrows():
-        if (r.get("Variant Barcode") or "").strip() == "":
-            warnings.append({"row": i + 2, "issue": "UPC/Barcode manquant"})
-        if (r.get("HTS Code") or "").strip() == "":
-            warnings.append({"row": i + 2, "issue": "HTS Code manquant"})
-        if (r.get("Color") or "").strip() == "":
-            warnings.append({"row": i + 2, "issue": "Color vide (après fallback/standardisation)"})
-        if (r.get("Size") or "").strip() == "":
-            warnings.append({"row": i + 2, "issue": "Size vide (après fallback/standardisation)"})
-        if (r.get("Shopify Category Name") or "").strip() == "":
-            warnings.append({"row": i + 2, "issue": "Aucun match Shopify Product Category (nom) via Description"})
-        if (r.get("Google Category Name") or "").strip() == "":
-            warnings.append({"row": i + 2, "issue": "Aucun match Google Product Category (nom) via Description"})
+    # Color / Size input (prefer vendor columns)
+    sup["_color_raw"] = sup[color_col].astype(str).fillna("").map(_norm) if color_col else ""
+    sup["_size_raw"] = sup[size_col].astype(str).fillna("").map(_norm) if size_col else ""
 
-    # Output
-    out = pd.DataFrame(columns=SHOPIFY_COLUMNS)
-    out["Handle"] = df["Handle"]
-    out["Command"] = "NEW"  # ✅ a) NEW
-    out["Title"] = df["Title"]
-    out["Body (HTML)"] = ""  # MVP
-    out["Vendor"] = vendor_name
+    # Fallback parse from description if missing
+    parsed = sup["_desc_raw"].apply(_extract_color_size_from_description)
+    sup["_color_fb"] = parsed.map(lambda t: t[0])
+    sup["_size_fb"] = parsed.map(lambda t: t[1])
 
-    # ✅ b) Category: ID = NOM catégorie (pas numéro)
-    out["Category: ID"] = df["Shopify Category Name"]
+    sup["_color_in"] = sup["_color_raw"]
+    sup.loc[sup["_color_in"].eq(""), "_color_in"] = sup["_color_fb"]
 
-    out["Variant Option1 Name"] = "Size"
-    out["Variant Option1 Value"] = df["Size"].astype(str).fillna("")
+    sup["_size_in"] = sup["_size_raw"]
+    sup.loc[sup["_size_in"].eq(""), "_size_in"] = sup["_size_fb"]
 
-    out["Variant Option2 Name"] = "Color"
-    out["Variant Option2 Value"] = df["Color"].astype(str).fillna("")
+    # Standardize -> MUST output col B (your mapping)
+    sup["_color_std"] = sup["_color_in"].apply(lambda x: _standardize(x, color_map))
+    sup["_size_std"] = sup["_size_in"].apply(lambda x: _standardize(x, size_map))
 
-    out["Variant Price"] = df["Variant Price"]
-    out["Variant SKU"] = df["Product"].astype(str).fillna("")
-    out["Variant Barcode"] = df["Variant Barcode"]  # ✅ c) conserve zéros
-    out["Variant Inventory Qty"] = 0  # ✅ g) toujours 0
+    # Gender (standardize if possible)
+    sup["_gender_raw"] = sup[gender_col].astype(str).fillna("").map(_norm) if gender_col else ""
+    sup["_gender_std"] = sup["_gender_raw"].apply(lambda x: _standardize(x, gender_map)) if gender_map else sup["_gender_raw"]
 
-    out["Country of Origin"] = df["Origin"].astype(str).fillna("")
-    out["HS Code"] = df["HTS Code"].astype(str).fillna("")
+    # Vendor / Brand
+    sup["_vendor"] = vendor_name
+    sup["_brand_choice"] = _norm(brand_choice)
 
-    # ✅ d) Metafield = NOM catégorie Google (pas numéro)
-    out["Metafield: mm-google-shopping.google_product_category"] = df["Google Category Name"]
+    # Title (for Shopify): Description + Color (standardized)
+    sup["_title"] = (sup["_desc_raw"] + " " + sup["_color_std"]).str.strip()
 
-    warnings_df = pd.DataFrame(warnings)
+    # -------------------------
+    # (1) Handle rule (UPDATED)
+    # Vendor + Gender + Description + Color, hyphens (slugify)
+    # -------------------------
+    def _make_handle(r):
+        parts = [
+            _strip_reg_for_handle(r["_vendor"]),
+            _strip_reg_for_handle(r["_gender_std"]),
+            r["_desc_handle"],
+            _strip_reg_for_handle(r["_color_std"]),
+        ]
+        parts = [p for p in parts if p and str(p).strip()]
+        return slugify(" ".join(parts))
 
-    # Export Excel
+    sup["_handle"] = sup.apply(_make_handle, axis=1)
+
+    # Custom Product Type (loose singular/plural)
+    sup["_product_type"] = sup["_title"].apply(lambda t: _best_match_product_type(t, product_types))
+
+    # Tags
+    def _make_tags(r):
+        tags = []
+        if r["_vendor"]:
+            tags.append(r["_vendor"])
+        if r["_color_std"]:
+            tags.append(r["_color_std"])
+        if r["_gender_std"]:
+            tags.append(r["_gender_std"])
+        tags.append("_badge_new")
+        if r["_product_type"]:
+            tags.append(r["_product_type"])
+
+        g = str(r["_gender_std"]).lower()
+        if "men" in g and "women" in g:
+            tags.extend(["Men", "Women"])
+        return ", ".join([t for t in tags if t])
+
+    sup["_tags"] = sup.apply(_make_tags, axis=1)
+
+    # SKU: external id else product code else fallback
+    sup["_external_id"] = sup[extid_col].astype(str).fillna("").map(_norm) if extid_col else ""
+    sup["_product_code"] = sup[product_col].astype(str).fillna("").map(_norm) if product_col else ""
+
+    def _make_sku(r):
+        if r["_external_id"]:
+            return r["_external_id"]
+        if r["_product_code"]:
+            return r["_product_code"]
+        base = r["_product_code"] or "SKU"
+        return f"{base}-{r['_size_std']}-{r['_color_std']}".strip("-")
+
+    sup["_variant_sku"] = sup.apply(_make_sku, axis=1)
+
+    # Barcode
+    sup["_barcode"] = sup[upc_col].apply(_barcode_keep_zeros) if upc_col else ""
+
+    # Country (standardize)
+    sup["_origin_raw"] = sup[origin_col].astype(str).fillna("").map(_norm) if origin_col else ""
+    sup["_origin_std"] = sup["_origin_raw"].apply(lambda x: _standardize(x, country_map))
+
+    # HS Code (3)
+    sup["_hs"] = sup[hs_col].apply(_hs_code_clean) if hs_col else ""
+
+    # Grams (2/5 - keep)
+    sup["_grams"] = sup[grams_col].astype(str).fillna("").map(_norm) if grams_col else ""
+
+    # Price
+    msrp_num = pd.to_numeric(
+        sup[msrp_col].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False),
+        errors="coerce",
+    )
+    sup["_price"] = msrp_num.apply(_round_to_nearest_9_99)
+
+    # Cost
+    sup["_cost"] = sup[landed_col].astype(str).fillna("").map(_norm) if landed_col else ""
+
+    # Size comment: prefer brand else vendor
+    def _size_comment(r):
+        key = (r["_brand_choice"] or r["_vendor"]).strip().lower()
+        return size_comment_map.get(key, "")
+
+    sup["_size_comment"] = sup.apply(_size_comment, axis=1)
+
+    # Categories
+    sup["_shopify_cat_id"] = sup["_title"].apply(lambda t: _best_match_id(t, shopify_cat_rows))
+    sup["_google_cat_id"] = sup["_title"].apply(lambda t: _best_match_id(t, google_cat_rows))
+
+    # Siblings
+    sup["_siblings"] = sup.apply(lambda r: slugify(f"{r['_vendor']} {r['_desc_handle']}"), axis=1)
+
+    # SEO Title (same rules you had)
+    def _seo_title(r):
+        main = f"{r['_vendor']} {r['_gender_std']} {r['_desc_seo']}".strip()
+        main = _title_case_preserve_registered(main)
+        color = _title_case_preserve_registered(r["_color_std"])
+        return f"{main} - {color}".strip() if color else main
+
+    sup["_seo_title"] = sup.apply(_seo_title, axis=1)
+
+    # (3) SEO Description rule (UPDATED)
+    # Prefix stays identical; we ONLY replace the "[products.]" part if brand exists in SEO Description Brand Part.
+    # Vendor name must be present at the end.
+    def _seo_desc(r):
+        prefix = (
+            f"Shop the {r['_seo_title']} with free worldwide shipping, and 30-day returns on leclub.cc. Discover "
+        )
+
+        bkey = (r["_brand_choice"] or "").strip().lower()
+        if bkey and bkey in brand_desc_map:
+            middle = brand_desc_map[bkey].strip()
+        else:
+            middle = "products."
+
+        # Ensure vendor at end
+        vend = r["_vendor"].strip()
+        # avoid double punctuation
+        middle = middle.rstrip()
+        if not middle.endswith("."):
+            middle = middle + "."
+        return f"{prefix}{middle} {vend}."
+
+    sup["_seo_desc"] = sup.apply(_seo_desc, axis=1)
+
+    # (8) behind the brand
+    def _behind_brand(r):
+        bkey = (r["_brand_choice"] or "").strip().lower()
+        return brand_lines_map.get(bkey, "") if bkey else ""
+
+    sup["_behind_the_brand"] = sup.apply(_behind_brand, axis=1)
+
+    # ---------------------------------------------------------
+    # Build output (strict order)
+    # ---------------------------------------------------------
+    out = pd.DataFrame(columns=SHOPIFY_OUTPUT_COLUMNS)
+
+    out["Handle"] = sup["_handle"]
+    out["Command"] = "NEW"
+    out["Title"] = sup["_title"]
+    out["Body (HTML)"] = ""
+    out["Vendor"] = sup["_vendor"]
+    out["Custom Product Type"] = sup["_product_type"]
+    out["Tags"] = sup["_tags"]
+
+    out["Published"] = False
+    out["Published Scope"] = "global"
+
+    out["Option1 Name"] = "Size"
+    out["Option1 Value"] = sup["_size_std"]  # (2)(5)
+
+    out["Variant SKU"] = sup["_variant_sku"]
+    out["Variant Barcode"] = sup["_barcode"]
+    out["Variant Country of Origin"] = sup["_origin_std"]
+    out["Variant HS Code"] = sup["_hs"]
+    out["Variant Grams"] = sup["_grams"]
+
+    out["Variant Inventory Tracker"] = "shopify"
+    out["Variant Inventory Policy"] = "deny"
+    out["Variant Fulfillment Service"] = "manual"
+    out["Variant Price"] = sup["_price"]
+
+    out["Variant Requires Shipping"] = True
+    out["Variant Taxable"] = True
+
+    out["SEO Title"] = sup["_seo_title"]
+    out["SEO Description"] = sup["_seo_desc"]
+
+    out["Variant Weight Unit"] = "g"
+    out["Cost per item"] = sup["_cost"]
+    out["Status"] = "draft"
+
+    out["Metafield: my_fields.product_use_case [multi_line_text_field]"] = ""
+    out["Metafield: my_fields.product_features [multi_line_text_field]"] = ""
+    out["Metafield: my_fields.behind_the_brand [multi_line_text_field]"] = sup["_behind_the_brand"]
+    out["Metafield: my_fields.size_comment [single_line_text_field]"] = sup["_size_comment"]
+    out["Metafield: my_fields.gender [single_line_text_field]"] = sup["_gender_std"]
+
+    # (4) color metafields must be standardized
+    out["Metafield: my_fields.colour [single_line_text_field]"] = sup["_color_std"]
+    out["Metafield: mm-google-shopping.color"] = sup["_color_std"]
+
+    # (5) size metafield must be standardized
+    out["Variant Metafield: mm-google-shopping.size"] = sup["_size_std"]
+
+    out["Metafield: mm-google-shopping.size_system"] = "US"
+    out["Metafield: mm-google-shopping.condition"] = "new"
+    out["Metafield: mm-google-shopping.google_product_category"] = sup["_google_cat_id"]
+    out["Metafield: mm-google-shopping.gender"] = sup["_gender_std"]
+
+    out["Variant Metafield: mm-google-shopping.mpn"] = sup["_variant_sku"]
+    out["Variant Metafield: mm-google-shopping.gtin"] = sup["_barcode"]
+
+    out["Metafield: theme.siblings [single_line_text_field]"] = sup["_siblings"]
+
+    out["Category: ID"] = sup["_shopify_cat_id"]
+
+    out["Inventory Available: Boutique"] = 0
+    out["Inventory Available: Le Club"] = 0
+
+    out = out.reindex(columns=SHOPIFY_OUTPUT_COLUMNS)
+
+    # Yellow rules (kept from your spec)
+    yellow_if_empty_cols = [
+        "Handle",
+        "Title",
+        "Body (HTML)",
+        "Custom Product Type",
+        "Option1 Name",
+        "Option1 Value",
+        "Variant Price",
+        "Variant Grams",
+        "SEO Title",
+        "SEO Description",
+        "Metafield: my_fields.size_comment [single_line_text_field]",
+        "Metafield: my_fields.gender [single_line_text_field]",
+        "Metafield: my_fields.colour [single_line_text_field]",
+        "Metafield: mm-google-shopping.color",
+        "Variant Metafield: mm-google-shopping.size",
+        "Metafield: mm-google-shopping.google_product_category",
+        "Category: ID",
+    ]
+
+    # Export
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="shopify_import")
-        warnings_df.to_excel(writer, index=False, sheet_name="warnings")
-    buffer.seek(0)
+        pd.DataFrame(warnings).to_excel(writer, index=False, sheet_name="warnings")
 
-    return buffer.getvalue(), warnings_df
+    buffer = _apply_yellow_for_empty(buffer, "shopify_import", yellow_if_empty_cols)
+    return buffer.getvalue(), pd.DataFrame(warnings)
