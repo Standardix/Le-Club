@@ -1,16 +1,16 @@
 import streamlit as st
+import io
+import openpyxl
+import time
+
 from suppliers.fournisseur_abc import run_transform as run_abc
 
-st.set_page_config(
-    page_title="Générateur Shopify – Fichiers fournisseurs",
-    layout="wide"
-)
+st.set_page_config(page_title="Générateur Shopify – Fichiers fournisseurs", layout="wide")
 
 # --- CSS bouton (normal + hover) ---
 st.markdown(
     """
     <style>
-    /* Style pour tous les boutons Streamlit (MVP simple) */
     div[data-testid="stButton"] > button {
         background: #ffffff !important;
         border: 1px solid #d6d6d9 !important;
@@ -31,14 +31,13 @@ st.markdown(
     }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
-st.title("Générateur de fichier Shopify (MVP)")
+st.title("Générateur de fichier Shopify (Pilote)")
 
 SUPPLIERS = {
     "Fournisseur ABC": run_abc,
-    # Ajouter d'autres fournisseurs ici plus tard
 }
 
 st.markdown("### 1️⃣ Sélection du fournisseur")
@@ -48,23 +47,49 @@ st.markdown("### 2️⃣ Upload des fichiers")
 supplier_file = st.file_uploader("Fichier fournisseur (.xlsx)", type=["xlsx"])
 help_file = st.file_uploader("Help data (.xlsx)", type=["xlsx"])
 
+# 🔹 Projet pilote : pas de sélection de marque
+brand_choice = ""
+
 generate = st.button(
     "Générer le fichier Shopify",
     type="secondary",
-    disabled=not (supplier_file and help_file)
+    disabled=not (supplier_file and help_file),
 )
 
 if generate:
+    st.markdown("### Génération en cours")
+    status = st.empty()
+    progress = st.progress(0)
+
     try:
         transform_fn = SUPPLIERS[supplier_name]
 
-        output_bytes, warnings_df = transform_fn(
-            supplier_xlsx_bytes=supplier_file.getvalue(),
-            help_xlsx_bytes=help_file.getvalue(),
-            vendor_name=supplier_name
-        )
+        status.info("Préparation des fichiers…")
+        progress.progress(10)
+        time.sleep(0.15)
 
-        st.success("Fichier généré avec succès ✅")
+        status.info("Lecture du fichier fournisseur…")
+        progress.progress(25)
+        time.sleep(0.15)
+
+        status.info("Lecture du help data…")
+        progress.progress(40)
+        time.sleep(0.15)
+
+        with st.spinner("Traitement en cours…"):
+            output_bytes, warnings_df = transform_fn(
+                supplier_xlsx_bytes=supplier_file.getvalue(),
+                help_xlsx_bytes=help_file.getvalue(),
+                vendor_name=supplier_name,
+                brand_choice=brand_choice,  # toujours vide pour le pilote
+            )
+
+        status.info("Finalisation du fichier Shopify…")
+        progress.progress(85)
+        time.sleep(0.15)
+
+        progress.progress(100)
+        status.success("Fichier généré avec succès ✅")
 
         if warnings_df is not None and not warnings_df.empty:
             with st.expander("⚠️ Warnings détectés"):
@@ -74,8 +99,9 @@ if generate:
             label="⬇️ Télécharger output.xlsx",
             data=output_bytes,
             file_name=f"output_{supplier_name.replace(' ', '_')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     except Exception as e:
-        st.error(f"Erreur lors de la génération : {e}")
+        progress.empty()
+        status.error(f"Erreur lors de la génération : {e}")
