@@ -493,8 +493,75 @@ def run_transform(
     vendor_name: str,
     brand_choice: str = "",
 ):
-    sup = pd.read_excel(io.BytesIO(supplier_xlsx_bytes), sheet_name=0, dtype=str).copy()
     warnings: list[dict] = []
+
+    # -----------------------------------------------------
+    # Supplier reader (multi-sheet capable)
+    # -----------------------------------------------------
+    def _read_supplier_multi_sheet(xlsx_bytes: bytes) -> pd.DataFrame:
+        """
+        Reads supplier XLSX.
+        - If there are multiple sheets, keep only sheets that contain the minimum required columns
+          (Description-like + MSRP-like), then concatenate.
+        - If there is a single valid sheet, behaves like the previous implementation.
+        """
+        bio = io.BytesIO(xlsx_bytes)
+        xls = pd.ExcelFile(bio)
+
+        # Column candidates duplicated from the main logic (kept local to avoid refactors).
+        desc_candidates = [
+            "description", "Description", "Product Name", "product name",
+            "Title", "title", "Style", "style", "Style Name", "style name",
+            "Display Name", "display name", "Online Display Name", "online display name",
+        ]
+        msrp_candidates = [
+            "Cad MSRP", "MSRP", "Retail Price (CAD)", "retail price (CAD)", "retail price (cad)",
+        ]
+
+        dfs: list[pd.DataFrame] = []
+        for sn in xls.sheet_names:
+            df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sn, dtype=str)
+
+            # Drop fully empty rows early
+            if df is None or df.empty:
+                warnings.append({
+                    "type": "sheet_skipped",
+                    "sheet": sn,
+                    "reason": "empty",
+                })
+                continue
+            df = df.dropna(how="all")
+            if df.empty:
+                warnings.append({
+                    "type": "sheet_skipped",
+                    "sheet": sn,
+                    "reason": "empty",
+                })
+                continue
+
+            # Validate minimum required columns
+            has_desc = _first_existing_col(df, desc_candidates) is not None
+            has_msrp = _first_existing_col(df, msrp_candidates) is not None
+            if not (has_desc and has_msrp):
+                warnings.append({
+                    "type": "sheet_skipped",
+                    "sheet": sn,
+                    "reason": "missing_required_columns",
+                    "has_desc": has_desc,
+                    "has_msrp": has_msrp,
+                })
+                continue
+
+            df["_source_sheet"] = sn
+            dfs.append(df)
+
+        if not dfs:
+            raise ValueError(
+                "Aucun onglet valide détecté dans le fichier fournisseur (colonne Description + MSRP requises)."
+            )
+        return pd.concat(dfs, ignore_index=True, sort=False)
+
+    sup = _read_supplier_multi_sheet(supplier_xlsx_bytes).copy()
 
     wb = _load_help_wb(help_xlsx_bytes)
 
@@ -545,6 +612,46 @@ def run_transform(
         raise ValueError(
             "Colonne MSRP introuvable. Colonnes acceptées: Retail Price (CAD), Cad MSRP, MSRP."
         )
+
+    # -----------------------------------------------------
+    # De-duplicate across sheets (SKU and/or UPC)
+    # -----------------------------------------------------
+    def _clean_sku(x) -> str:
+        s = _norm(x)
+        return re.sub(r"\.0$", "", s)
+
+    def _make_dedupe_key(r) -> str:
+        sku = _clean_sku(r.get(extid_col, "")) if extid_col else ""
+        if not sku:
+            sku = _clean_sku(r.get(product_col, "")) if product_col else ""
+        upc = _barcode_keep_zeros(r.get(upc_col, "")) if upc_col else ""
+
+        if sku and upc:
+            return f"{sku}|{upc}"
+        if sku:
+            return sku
+        if upc:
+            return upc
+        # Fallback (rare): keep row unique if neither exists
+        return ""
+
+    sup["_dedupe_key"] = sup.apply(_make_dedupe_key, axis=1)
+
+    before = len(sup)
+    # Only dedupe rows where we have at least one identifier; keep all others.
+    has_key = sup["_dedupe_key"].astype(str).str.strip().ne("")
+    sup_keyed = sup.loc[has_key].drop_duplicates(subset=["_dedupe_key"], keep="first")
+    sup_unkeyed = sup.loc[~has_key]
+    sup = pd.concat([sup_keyed, sup_unkeyed], ignore_index=True)
+    after = len(sup)
+    if after < before:
+        warnings.append({
+            "type": "dedupe_applied",
+            "dedupe_by": "SKU and/or UPC",
+            "rows_before": before,
+            "rows_after": after,
+            "rows_removed": before - after,
+        })
 
     # Base description
     sup["_desc_raw"] = sup[desc_col].astype(str).fillna("").map(_norm)
