@@ -34,7 +34,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Générateur de fichier Shopify (Pilote)")
+st.title("Générateur de fichier Shopify")
 
 SUPPLIERS = {
     "Balmoral": run_abc,
