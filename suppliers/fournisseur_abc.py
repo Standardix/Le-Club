@@ -67,6 +67,13 @@ def _norm(s) -> str:
     return re.sub(r"\s+", " ", str(s or "").strip())
 
 
+
+def _clean_style_key(v) -> str:
+    s = _norm(v)
+    # if Excel treated numeric as float: 123.0 -> 123
+    s = re.sub(r"^(\d+)\.0+$", r"\1", s)
+    return s
+
 def _strip_reg_for_handle(s: str) -> str:
     """Handle only: remove ® and (r)/[r] to keep URL safe."""
     t = _norm(s)
@@ -492,8 +499,13 @@ def run_transform(
     help_xlsx_bytes: bytes,
     vendor_name: str,
     brand_choice: str = "",
+    event_promo_tag: str = "",
+    style_season_map: dict[str, str] | None = None,
 ):
     warnings: list[dict] = []
+
+    style_season_map = style_season_map or {}
+    style_season_map = { _clean_style_key(k): v for k, v in style_season_map.items() }
 
     # -----------------------------------------------------
     # Supplier reader (multi-sheet capable)
@@ -597,7 +609,7 @@ def run_transform(
     size_col = _first_existing_col(sup, ["Size", "size", "Vendor Size1", "vendor size1"])
     upc_col = _first_existing_col(sup, ["UPC", "UPC Code", "upc", "upc code"])
     origin_col = _first_existing_col(sup, ["Country Code", "Origin", "Manufacturing Country", "COO", "country code", "origin", "manufacturing country", "coo"])
-    hs_col = _first_existing_col(sup, ["HS Code", "HTS Code"])
+    hs_col = _first_existing_col(sup, ["HS Code", "HTS Code", "hs code", "hts code"])
     extid_col = _first_existing_col(sup, ["External ID", "ExternalID"])
     msrp_col = _first_existing_col(sup, ["Cad MSRP", "MSRP", "Retail Price (CAD)", "retail price (CAD)", "retail price (cad)"])
     landed_col = _first_existing_col(sup, ["Landed", "landed", "Wholesale Price", "wholesale price", "Wholesale Price (CAD)", "wholesale price (cad)"])
@@ -718,17 +730,43 @@ def run_transform(
     sup["_product_type"] = sup["_desc_raw"].apply(lambda t: _best_match_product_type(t, product_types))
 
     # Tags (keep standardized color/gender tags)
+    # -----------------------------------------------------
+    # Seasonality key (to apply Seasonality Tags per style)
+    # -----------------------------------------------------
+    style_num_col = _first_existing_col(sup, ["Style Number", "Style Num", "Style #", "style number", "style #", "Style"])
+    style_name_col = _first_existing_col(sup, ["Style Name", "style name", "Product Name", "Name"])
+    sup["_seasonality_key"] = ""
+    if style_num_col is not None:
+        sup["_seasonality_key"] = sup[style_num_col].astype(str).fillna("").map(_clean_style_key)
+    elif style_name_col is not None:
+        sup["_seasonality_key"] = sup[style_name_col].astype(str).fillna("").map(_clean_style_key)
+
     def _make_tags(r):
         tags = []
         if r["_vendor"]:
             tags.append(r["_vendor"])
         if r["_color_std"]:
             tags.append(r["_color_std"])
+        # Colour-based tags
+        if _norm(r["_color_std"]).lower() == "black":
+            tags.append("Core")
+        else:
+            tags.append("Seasonal")
+
         if r["_gender_std"]:
             tags.append(r["_gender_std"])
         tags.append("_badge_new")
         if r["_product_type"]:
             tags.append(r["_product_type"])
+        # Event/Promotion Related (applies to entire file)
+        if event_promo_tag:
+            tags.append(event_promo_tag)
+
+        # Seasonality tag (per style)
+        stg = style_season_map.get(_clean_style_key(r.get("_seasonality_key", "")))
+        if stg:
+            tags.append(stg)
+
         return ", ".join([t for t in tags if t])
 
     sup["_tags"] = sup.apply(_make_tags, axis=1)
@@ -906,10 +944,49 @@ def run_transform(
         "Category: ID",
     ]
 
+    def _apply_red_font_for_tags(buffer: io.BytesIO, sheet_name: str, rows_to_color_red: list[int]) -> io.BytesIO:
+        """Apply red font to the 'Tags' cell for given 0-based dataframe row indexes."""
+        buffer.seek(0)
+        wb = openpyxl.load_workbook(buffer)
+        if sheet_name not in wb.sheetnames:
+            return buffer
+        ws = wb[sheet_name]
+
+        # Find Tags column index from header row (row 1)
+        tags_col_idx = None
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=1, column=c).value
+            if str(v).strip() == "Tags":
+                tags_col_idx = c
+                break
+        if tags_col_idx is None:
+            return buffer
+
+        red_font = openpyxl.styles.Font(color="FFFF0000")
+
+        # Data rows start at Excel row 2
+        for df_i in rows_to_color_red:
+            excel_row = df_i + 2
+            cell = ws.cell(row=excel_row, column=tags_col_idx)
+            cell.font = red_font
+
+        out = io.BytesIO()
+        wb.save(out)
+        out.seek(0)
+        return out
+
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="shopify_import")
         pd.DataFrame(warnings).to_excel(writer, index=False, sheet_name="warnings")
+
+    # Red font for Tags when colour is NOT Black (i.e., Seasonal)
+    rows_to_color_red_cells = [
+        i
+        for i, c in enumerate(sup["_color_std"].astype(str).tolist())
+        if _norm(c) != "" and _norm(c).lower() != "black"
+    ]
+    buffer = _apply_red_font_for_tags(buffer, "shopify_import", rows_to_color_red_cells)
 
     buffer = _apply_yellow_for_empty(buffer, "shopify_import", yellow_if_empty_cols)
     return buffer.getvalue(), pd.DataFrame(warnings)
