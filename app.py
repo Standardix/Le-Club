@@ -2,6 +2,9 @@ import streamlit as st
 import io
 import openpyxl
 import time
+import hashlib
+import pandas as pd
+import re
 
 from suppliers.fournisseur_abc import run_transform as run_abc
 
@@ -55,6 +58,187 @@ st.markdown("### 2️⃣ Upload des fichiers")
 supplier_file = st.file_uploader("Fichier fournisseur (.xlsx)", type=["xlsx"])
 help_file = st.file_uploader("Help data (.xlsx)", type=["xlsx"])
 
+
+st.markdown("### 3️⃣ Tags")
+
+event_promo_tag = st.selectbox(
+    "Event/Promotion Related",
+    options=["", "spring-summer", "fall-winter"],
+    index=0,
+)
+
+style_season_map: dict[str, str] = {}
+
+def _clean_style_key(v) -> str:
+    s = " ".join(str(v or "").strip().split())
+    # if Excel treated numeric as float: 123.0 -> 123
+    s = re.sub(r"^(\d+)\.0+$", r"\1", s)
+    return s
+
+def _first_existing_col(cols: list[str], candidates: list[str]) -> str | None:
+    cols_l = [c.lower() for c in cols]
+    for c in candidates:
+        if c.lower() in cols_l:
+            return cols[cols_l.index(c.lower())]
+    return None
+
+def _extract_unique_style_rows(xlsx_bytes: bytes) -> pd.DataFrame | None:
+    """Extract unique styles from the supplier file.
+
+    Returns a dataframe with columns (when available) in this order:
+      1) Style Name
+      2) Style Number
+    """
+    bio = io.BytesIO(xlsx_bytes)
+    xls = pd.ExcelFile(bio)
+
+    style_number_candidates = [
+        "Style Number", "Style Num", "Style #", "style number", "style #", "Style",
+    ]
+    style_name_candidates = [
+        "Style Name", "style name", "Product Name", "Name",
+    ]
+
+    rows: list[pd.DataFrame] = []
+    for sheet in xls.sheet_names:
+        try:
+            df = pd.read_excel(xls, sheet_name=sheet)
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+
+        num_col = _first_existing_col(list(df.columns), style_number_candidates)
+        name_col = _first_existing_col(list(df.columns), style_name_candidates)
+
+        if not num_col and not name_col:
+            continue
+
+        data = {}
+        if name_col:
+            data["Style Name"] = df[name_col].map(_clean_style_key)
+        if num_col:
+            data["Style Number"] = df[num_col].map(_clean_style_key)
+
+        tmp = pd.DataFrame(data)
+        for c in tmp.columns:
+            tmp = tmp[tmp[c].astype(str).str.strip().ne("").fillna(False)]
+
+        if not tmp.empty:
+            rows.append(tmp)
+
+    if not rows:
+        return None
+
+    out = pd.concat(rows, ignore_index=True).drop_duplicates()
+
+    cols = []
+    if "Style Name" in out.columns:
+        cols.append("Style Name")
+    if "Style Number" in out.columns:
+        cols.append("Style Number")
+
+    return out[cols].reset_index(drop=True)
+
+if supplier_file is not None:
+    style_rows_df = _extract_unique_style_rows(supplier_file.getvalue())
+    if style_rows_df is not None and not style_rows_df.empty:
+        st.markdown("#### Seasonality")
+
+        key_col = "Style Number" if "Style Number" in style_rows_df.columns else "Style Name"
+        # Stabilize ordering so the fingerprint doesn't change between reruns
+        style_rows_df = style_rows_df.sort_values(by=key_col).reset_index(drop=True)
+
+        supplier_fp = hashlib.md5(supplier_file.getvalue()).hexdigest()
+        styles_fp = hashlib.md5("|".join(style_rows_df[key_col].astype(str).tolist()).encode("utf-8")).hexdigest()
+        fp = f"{supplier_fp}:{styles_fp}:{key_col}"
+        widget_key = "seasonality_editor"
+
+        # Initialize/refresh ONLY when file/styles change
+        if st.session_state.get("seasonality_fp") != fp:
+            st.session_state["seasonality_fp"] = fp
+
+            # preserve prior entries from stored df (not widget key)
+            prev = st.session_state.get("seasonality_df")
+            prev_map = {}
+            if prev is not None and isinstance(prev, pd.DataFrame) and key_col in prev.columns and "Seasonality Tags" in prev.columns:
+                prev_map = {
+                    _clean_style_key(k): str(v).strip()
+                    for k, v in zip(prev[key_col].astype(str), prev['Seasonality Tags'].astype(str))
+                    if _clean_style_key(k)
+                }
+
+            init_df = style_rows_df.copy()
+            init_df["Seasonality Tags"] = init_df[key_col].astype(str).map(lambda k: prev_map.get(_clean_style_key(k), ""))
+            st.session_state["seasonality_df"] = init_df
+
+            # Reset the widget state so it reloads the new dataframe cleanly
+            if widget_key in st.session_state:
+                del st.session_state[widget_key]
+
+        # Safety: ensure df exists
+        if "seasonality_df" not in st.session_state or st.session_state["seasonality_df"] is None:
+            tmp = style_rows_df.copy()
+            tmp["Seasonality Tags"] = ""
+            st.session_state["seasonality_df"] = tmp
+
+            st.session_state["seasonality_fp"] = fp
+
+            # reset widget state only on change
+            if "seasonality_editor" in st.session_state:
+                del st.session_state["seasonality_editor"]
+
+            prev = st.session_state.get("seasonality_df")
+            prev_map = {}
+            if prev is not None and key_col in prev.columns and "Seasonality Tags" in prev.columns:
+                prev_map = {
+                    _clean_style_key(k): str(v or "").strip()
+                    for k, v in zip(prev[key_col], prev["Seasonality Tags"])
+                    if _clean_style_key(k)
+                }
+
+            init_df = style_rows_df.copy()
+            init_df["Seasonality Tags"] = init_df[key_col].map(lambda k: prev_map.get(_clean_style_key(k), ""))
+            st.session_state["seasonality_df"] = init_df
+
+        # guard
+        if "seasonality_df" not in st.session_state or st.session_state["seasonality_df"] is None:
+            tmp = style_rows_df.copy()
+            tmp["Seasonality Tags"] = ""
+            st.session_state["seasonality_df"] = tmp
+
+        edited_df = st.data_editor(
+            st.session_state["seasonality_df"],
+            key="seasonality_editor",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Style Name": st.column_config.TextColumn(disabled=True),
+                "Style Number": st.column_config.TextColumn(disabled=True),
+                "Seasonality Tags": st.column_config.TextColumn(
+                    help="Champ libre (ex: spring-summer, fall-winter, core, etc.)",
+                    required=False,
+                ),
+            },
+        )
+
+        # Use the widget live state; normalize to DataFrame
+        current_df = st.session_state.get("seasonality_editor", edited_df)
+        if not isinstance(current_df, pd.DataFrame):
+            try:
+                current_df = pd.DataFrame(current_df)
+            except Exception:
+                current_df = edited_df
+        style_season_map = {}
+        for _, r in current_df.iterrows():
+            k = _clean_style_key(r.get(key_col, ""))
+            v = str(r.get("Seasonality Tags", "")).strip()
+            if k and v:
+                style_season_map[k] = v
+    else:
+        st.info("Aucun champ 'Style Name' ou 'Style Number' détecté dans le fichier. Seasonality ignorée.")
+
 # 🔹 Projet pilote : pas de sélection de marque
 brand_choice = ""
 
@@ -90,6 +274,8 @@ if generate:
                 help_xlsx_bytes=help_file.getvalue(),
                 vendor_name=supplier_name,
                 brand_choice=brand_choice,  # toujours vide pour le pilote
+                            event_promo_tag=event_promo_tag,
+                style_season_map=style_season_map,
             )
 
         status.info("Finalisation du fichier Shopify…")
