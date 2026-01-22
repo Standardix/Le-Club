@@ -220,6 +220,34 @@ def _read_list_column(wb, sheet_name: str) -> list[str]:
     return out
 
 
+
+def _read_variant_weight_map(wb, sheet_name: str = "Variant Weight (Grams)") -> dict[str, str]:
+    """
+    Map Custom Product Type -> Variant Weight (Grams)
+    from Help Data sheet "Variant Weight (Grams)".
+    """
+    if sheet_name not in wb.sheetnames:
+        return {}
+    ws = wb[sheet_name]
+    m: dict[str, str] = {}
+    for r in range(2, ws.max_row + 1):
+        k = ws.cell(row=r, column=1).value
+        v = ws.cell(row=r, column=2).value
+        if k is None or v is None:
+            continue
+        ks = str(k).strip()
+        if not ks or ks.lower() == "nan":
+            continue
+        # keep grams as string (Shopify expects a number; empty string means "unknown")
+        if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)):
+            vs = str(int(v)) if float(v).is_integer() else str(v)
+        else:
+            vs = str(v).strip()
+        if vs.lower() == "nan":
+            continue
+        m[ks.lower()] = vs
+    return m
+
 def _read_category_rows(wb, sheet_name: str):
     """returns list[(name_keywords, id)] from columns A,B. Handles sheets with or without headers."""
     if sheet_name not in wb.sheetnames:
@@ -587,6 +615,8 @@ def run_transform(
     shopify_cat_rows = _read_category_rows(wb, "Shopify Product Category")
     google_cat_rows = _read_category_rows(wb, "Google Product Category")
     product_types = _read_list_column(wb, "Product Types")
+    variant_weight_map = _read_variant_weight_map(wb)
+
 
     # Brand maps
     brand_desc_map = _read_brand_line_map(wb, "SEO Description Brand Part")
@@ -796,7 +826,11 @@ def run_transform(
     sup["_hs"] = sup[hs_col].apply(_hs_code_clean) if hs_col else ""
 
     # Grams
-    sup["_grams"] = sup[grams_col].astype(str).fillna("").map(_norm) if grams_col else ""
+    if grams_col:
+        sup["_grams"] = sup[grams_col].astype(str).fillna("").map(_norm)
+    else:
+        # Fallback: use Help Data -> "Variant Weight (Grams)" mapped by Custom Product Type
+        sup["_grams"] = sup["_product_type"].apply(lambda pt: variant_weight_map.get(str(pt).strip().lower(), "") if pt else "")
 
     # Price
     msrp_num = pd.to_numeric(
