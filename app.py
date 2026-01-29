@@ -47,18 +47,24 @@ SUPPLIERS = {
     "District Vision": run_abc,
     "Fingerscrossed": run_abc,
     "MAAP": run_abc,
+    "norda": run_abc,
     "Pas Normal Studios": run_abc,
+    "Rapha": run_abc,
+    "Soar": run_abc,
     "Tracksmith": run_abc,
+    "Satisfy": run_abc,
+
 }
 
 st.markdown("### 1️⃣ Sélection du fournisseur")
-supplier_name = st.selectbox("Choisir le fournisseur", list(SUPPLIERS.keys()))
+supplier_name = st.selectbox("Choisir le fournisseur", sorted(SUPPLIERS.keys(), key=lambda x: x.lower()))
 
 st.markdown("### 2️⃣ Upload des fichiers")
 supplier_file = st.file_uploader("Fichier fournisseur (.xlsx)", type=["xlsx"])
 help_file = st.file_uploader("Help data (.xlsx)", type=["xlsx"])
 
 
+existing_shopify_file = st.file_uploader("Fichier de produits existant dans Shopify (.xlsx)", type=["xlsx"])
 st.markdown("### 3️⃣ Tags")
 
 event_promo_tag = st.selectbox(
@@ -75,14 +81,52 @@ def _clean_style_key(v) -> str:
     s = re.sub(r"^(\d+)\.0+$", r"\1", s)
     return s
 
+def _clean_style_number_base(v) -> str:
+    """
+    Seasonality UX: keep only what is BEFORE the first hyphen.
+    Example: 11000-FA-SAB -> 11000
+    """
+    s = _clean_style_key(v)
+    if not s:
+        return ""
+    return s.split("-", 1)[0].strip()
+
 def _first_existing_col(cols: list[str], candidates: list[str]) -> str | None:
-    cols_l = [c.lower() for c in cols]
-    for c in candidates:
-        if c.lower() in cols_l:
-            return cols[cols_l.index(c.lower())]
+    """
+    Robust column matcher:
+    - strip surrounding whitespace
+    - collapse internal whitespace
+    - case-insensitive
+    - fallback to contains match
+    """
+    def norm(x: str) -> str:
+        s = str(x or "")
+        s = re.sub(r"\s+", " ", s).strip().lower()
+        return s
+
+    col_map = {norm(c): c for c in cols}
+    for cand in candidates:
+        k = norm(cand)
+        if k in col_map:
+            return col_map[k]
+
+    cols_norm = [(norm(c), c) for c in cols]
+    for cand in candidates:
+        ck = norm(cand)
+        if not ck:
+            continue
+        for cn, orig in cols_norm:
+            if ck in cn:
+                return orig
     return None
 
-def _extract_unique_style_rows(xlsx_bytes: bytes) -> pd.DataFrame | None:
+
+def _norm(s) -> str:
+    """Normalize cell text for display (keep content, just collapse whitespace)."""
+    return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
+def _extract_unique_style_rows(xlsx_bytes: bytes, supplier_name: str = "") -> pd.DataFrame | None:
     """Extract unique styles from the supplier file.
 
     Returns a dataframe with columns (when available) in this order:
@@ -92,33 +136,101 @@ def _extract_unique_style_rows(xlsx_bytes: bytes) -> pd.DataFrame | None:
     bio = io.BytesIO(xlsx_bytes)
     xls = pd.ExcelFile(bio)
 
+
+    vendor_key = re.sub(r"[\s\-_/]+", "", str(supplier_name or "").strip().lower())
+    is_pas = vendor_key in ("pasnormalstudios", "pasnormalstudio")
+    # PAS Normal Studios: use only "Summary + Data" like the transformer (ensures correct STYLE NAME)
+    if vendor_key in ("pasnormalstudios", "pasnormalstudio") and "Summary + Data" in xls.sheet_names:
+            sheet_names = ["Summary + Data"]
+    else:
+        sheet_names = list(xls.sheet_names)
+    # Prefer explicit style-number fields (avoid generic "Style" which can match a style-name field in some files)
     style_number_candidates = [
-        "Style Number", "Style Num", "Style #", "style number", "style #", "Style",
+        "Style NO", "Style No", "STYLE NO", "style no",
+        "Style Number", "Style Num", "Style #", "style number", "style #",
+        "Style Code", "style code",
     ]
     style_name_candidates = [
-        "Style Name", "style name", "Product Name", "Name",
+        "STYLE NAME", "Style Name", "Style name", "style name",
+        "Product Name", "Name",
     ]
 
     rows: list[pd.DataFrame] = []
-    for sheet in xls.sheet_names:
+    for sheet in sheet_names:
         try:
             df = pd.read_excel(xls, sheet_name=sheet)
+
+            # PAS: Force the supplier column "STYLE NAME" as the source for Style Name (when present)
+            if is_pas:
+                def _find_pas_style_name(cols: list[str]) -> str | None:
+                    def norm(x: str) -> str:
+                        return re.sub(r"\s+", " ", str(x or "")).strip().lower()
+                    for c in cols:
+                        if norm(c) == "style name":
+                            return c
+                    return None
+
+                pas_style_name_col = _find_pas_style_name(list(df.columns))
+                if pas_style_name_col:
+                    # Override candidate list so we never match other "...NAME" columns (ex: STYLE COLOR NAME)
+                    style_name_candidates = [pas_style_name_col]
         except Exception:
             continue
         if df is None or df.empty:
             continue
 
+        # PAS: keep only rows with Order Qty >= 1 when extracting Seasonality styles
+        if is_pas:
+            oq_col = _first_existing_col(list(df.columns), ["Order Qty", "order qty", "Order Quantity", "order quantity"])
+            if oq_col:
+                qty_num = pd.to_numeric(
+                    df[oq_col].astype(str).str.replace(",", "", regex=False).str.strip(),
+                    errors="coerce",
+                ).fillna(0)
+                df = df.loc[qty_num >= 1].copy()
+                if df.empty:
+                    continue
+
         num_col = _first_existing_col(list(df.columns), style_number_candidates)
-        name_col = _first_existing_col(list(df.columns), style_name_candidates)
+        # Style Name: STRICT priority on the real supplier column (avoid matching Product Name / Name)
+        def _find_style_name_col(cols: list[str]) -> str | None:
+            def norm(x: str) -> str:
+                return re.sub(r"\s+", " ", str(x or "")).strip().lower()
+            for c in cols:
+                nc = norm(c)
+                if nc in ("style name", "stylename", "style_name"):
+                    return c
+                if nc.startswith("style name"):
+                    return c
+            return None
+        # GLOBAL RULE: if a supplier column "Style Name" exists, ALWAYS use it for UX Style Name.
+        def _find_style_name_col(cols: list[str]) -> str | None:
+            def norm(x: str) -> str:
+                # collapse whitespace and lowercase for robust matching
+                return re.sub(r"\s+", " ", str(x or "")).strip().lower()
+            for c in cols:
+                nc = norm(c)
+                # accept common variants
+                if nc in ("style name", "stylename", "style_name", "style-name"):
+                    return c
+                if nc.startswith("style name"):
+                    return c
+            return None
+
+        name_col = _find_style_name_col(list(df.columns))
+        if not name_col:
+            # fallback ONLY when Style Name truly not present
+            name_col = _first_existing_col(list(df.columns), ["Product Name", "Name", "Title", "Description"])
 
         if not num_col and not name_col:
             continue
 
         data = {}
         if name_col:
-            data["Style Name"] = df[name_col].map(_clean_style_key)
+            pass
+        data["Style Name"] = df[name_col].astype(str).fillna("").map(_norm)
         if num_col:
-            data["Style Number"] = df[num_col].map(_clean_style_key)
+            data["Style Number"] = df[num_col].map(_clean_style_number_base)
 
         tmp = pd.DataFrame(data)
         for c in tmp.columns:
@@ -131,6 +243,24 @@ def _extract_unique_style_rows(xlsx_bytes: bytes) -> pd.DataFrame | None:
         return None
 
     out = pd.concat(rows, ignore_index=True).drop_duplicates()
+    # De-duplicate by Style Number ONLY (one row per style).
+    # If multiple Style Name values exist for the same Style Number in the supplier file,
+    # keep the most frequent value FROM THE ACTUAL "Style Name" column.
+    if "Style Number" in out.columns and "Style Name" in out.columns:
+        out["Style Number"] = out["Style Number"].astype(str).str.strip()
+        out["Style Name"] = out["Style Name"].astype(str).str.strip()
+
+        def mode_nonempty(s: pd.Series) -> str:
+            s = s.dropna().astype(str).str.strip()
+            s = s[s.ne("")]
+            if s.empty:
+                return ""
+            return s.value_counts().index[0]
+
+        agg = out.groupby("Style Number")["Style Name"].apply(mode_nonempty).reset_index()
+        out = agg
+
+
 
     cols = []
     if "Style Name" in out.columns:
@@ -141,7 +271,7 @@ def _extract_unique_style_rows(xlsx_bytes: bytes) -> pd.DataFrame | None:
     return out[cols].reset_index(drop=True)
 
 if supplier_file is not None:
-    style_rows_df = _extract_unique_style_rows(supplier_file.getvalue())
+    style_rows_df = _extract_unique_style_rows(supplier_file.getvalue(), supplier_name)
     if style_rows_df is not None and not style_rows_df.empty:
         st.markdown("#### Seasonality")
 
@@ -272,6 +402,7 @@ if generate:
             output_bytes, warnings_df = transform_fn(
                 supplier_xlsx_bytes=supplier_file.getvalue(),
                 help_xlsx_bytes=help_file.getvalue(),
+                existing_shopify_xlsx_bytes=(existing_shopify_file.getvalue() if existing_shopify_file is not None else None),
                 vendor_name=supplier_name,
                 brand_choice=brand_choice,  # toujours vide pour le pilote
                             event_promo_tag=event_promo_tag,
