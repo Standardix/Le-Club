@@ -265,6 +265,25 @@ def _strip_gender_prefix_size(v: str) -> str:
     return s
 
 
+def _is_onesize(v: str) -> bool:
+    """Return True if the size represents a One Size / OS variant."""
+    s = _norm(v).lower()
+    if not s:
+        return False
+    s2 = re.sub(r"[\s\-_]+", "", s)
+    if s2 in {"os", "onesize"}:
+        return True
+    if s.startswith("one size"):
+        return True
+    if s in {"one-size", "one size", "one_size", "onesize"}:
+        return True
+    if s in {"o/s", "o-s"}:
+        return True
+    if "one size fits" in s:
+        return True
+    return False
+
+
 def _strip_gender_tokens(text: str) -> str:
     """Remove embedded gender markers like -w-, - W -, -m-, etc from a string."""
     s = str(text or "")
@@ -1409,12 +1428,14 @@ def run_transform(
     sup["_product_code"] = sup[product_col].astype(str).fillna("").map(_norm) if product_col else ""
 
     def _make_sku(r):
+        # Rule v12: Only populate SKU when we have a reliable identifier from the supplier.
+        # If we don't have enough info (no External ID and no Product Code/SKU column),
+        # we leave it blank (and it will be highlighted in yellow by the existing rules).
         if r["_external_id"]:
             return r["_external_id"]
         if r["_product_code"]:
             return r["_product_code"]
-        base = r["_product_code"] or "SKU"
-        return f"{base}-{r['_size_std']}-{r['_color_std']}".strip("-")
+        return 
 
     sup["_variant_sku"] = sup.apply(_make_sku, axis=1)
 
@@ -1579,7 +1600,35 @@ def run_transform(
 
     sup["_behind_the_brand"] = sup.apply(_behind_brand, axis=1)
 
+    
     # ---------------------------------------------------------
+    # v12 Option1 rules
+    # ---------------------------------------------------------
+    # Default behavior: Option1 = Size (with gender prefix stripped)
+    sup["_opt1_name"] = "Size"
+    sup["_opt1_value"] = sup["_size_std"].map(_strip_gender_prefix_size)
+
+    # Rule 2: One Size (OS / One Size / variants) -> Title / Default Title
+    mask_onesize = sup["_size_std"].astype(str).apply(_is_onesize)
+    sup.loc[mask_onesize, "_opt1_name"] = "Title"
+    sup.loc[mask_onesize, "_opt1_value"] = "Default Title"
+
+    # Rule 3: If a style has only ONE row in the supplier file -> Title / Default Title
+    style_num_col_v12 = _first_existing_col(sup, ["Style Number", "Style Num", "Style #", "style number", "style #", "Style NO", "Style No", "STYLE NO", "style no"])
+    style_name_col_v12 = _first_existing_col(sup, ["Style Name", "style name", "STYLE NAME", "Product Name", "Name"])
+    sup["_style_key_v12"] = ""
+    if style_num_col_v12 is not None:
+        sup["_style_key_v12"] = sup[style_num_col_v12].astype(str).fillna("").map(_clean_style_key)
+    elif style_name_col_v12 is not None:
+        sup["_style_key_v12"] = sup[style_name_col_v12].astype(str).fillna("").map(_clean_style_key)
+
+    _k = sup["_style_key_v12"].astype(str).str.strip()
+    counts = _k[_k.ne("")].value_counts()
+    mask_single_style = _k.map(lambda x: counts.get(x, 0) == 1 if x else False)
+    sup.loc[mask_single_style, "_opt1_name"] = "Title"
+    sup.loc[mask_single_style, "_opt1_value"] = "Default Title"
+
+# ---------------------------------------------------------
     # Build output (strict order)
     # ---------------------------------------------------------
     out = pd.DataFrame(columns=SHOPIFY_OUTPUT_COLUMNS)
@@ -1595,8 +1644,8 @@ def run_transform(
     out["Published"] = False
     out["Published Scope"] = "global"
 
-    out["Option1 Name"] = "Size"
-    out["Option1 Value"] = sup["_size_std"].map(_strip_gender_prefix_size)
+    out["Option1 Name"] = sup["_opt1_name"]
+    out["Option1 Value"] = sup["_opt1_value"]
 
     out["Variant SKU"] = sup["_variant_sku"]
     out["Variant Barcode"] = sup["_barcode"]
