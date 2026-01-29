@@ -51,6 +51,7 @@ import pandas as pd
 import numpy as np
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
+from openpyxl.comments import Comment
 
 # Optional dependency: python-slugify
 try:
@@ -859,6 +860,33 @@ def _apply_red_font_for_rows_cols(buffer: io.BytesIO, sheet_name: str, rows_0bas
     outb.seek(0)
     return outb
 
+
+def _apply_header_notes(buffer: io.BytesIO, sheet_name: str, notes: dict[str, str]) -> io.BytesIO:
+    """
+    Add an Excel comment (note) on the HEADER CELL for specified columns.
+    Applied to the sheet's row 1 only.
+    """
+    buffer.seek(0)
+    wb = load_workbook(buffer)
+    if sheet_name not in wb.sheetnames:
+        return buffer
+    ws = wb[sheet_name]
+
+    headers = [str(c.value or "") for c in ws[1]]
+    col_index = {h: i + 1 for i, h in enumerate(headers) if h}
+
+    for col_name, note in notes.items():
+        if col_name not in col_index:
+            continue
+        cell = ws.cell(row=1, column=col_index[col_name])
+        cell.comment = Comment(note, "Le Club")
+        cell.comment.width = 360
+        cell.comment.height = 120
+
+    outb = io.BytesIO()
+    wb.save(outb)
+    outb.seek(0)
+    return outb
 
 # ---------------------------------------------------------
 # MAIN
@@ -1775,7 +1803,7 @@ def run_transform(
     buffer = _apply_yellow_for_empty(buffer, "products", yellow_if_empty_cols)
     buffer = _apply_yellow_for_empty(buffer, "do not import", yellow_if_empty_cols)
     # Red font for Title when it contains "?" or "/" (needs manual review)
-    title_warn_cols = ["Title"]
+    title_warn_cols = ["Title", "SEO Title"]
 
     def _rows_title_warn(df_slice: pd.DataFrame) -> list[int]:
         if "Title" not in df_slice.columns:
@@ -1814,5 +1842,20 @@ def run_transform(
     # Apply red font for handle conflicts (only the cell in Handle column)
     buffer = _apply_red_font_for_handle(buffer, "products", _rows_handle_conflict(products_df))
     buffer = _apply_red_font_for_handle(buffer, "do not import", _rows_handle_conflict(do_not_import_df))
+    # Header notes (Excel comments) to explain red formatting / validations
+    header_notes = {
+        "Handle": "ROUGE = Le handle existe déjà dans le fichier d’inventaire fourni.",
+        "Title": "ROUGE = Le titre comporte un des deux caractères suivants: ? ou /.",
+        "SEO Title": "ROUGE = Le titre comporte un des deux caractères suivants: ? ou /.",
+        "Tags": "ROUGE = Assurez-vous que les tags Seasonal sont bien les bons.",
+        "Metafield: my_fields.colour [single_line_text_field]": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
+        "Metafield: mm-google-shopping.color": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
+        "Custom Product Type": "Assurez-vous que les catégories trouvées sont bien les bonnes.",
+        "Metafield: mm-google-shopping.google_product_category": "Assurez-vous que les catégories trouvées sont bien les bonnes.",
+    }
+
+    buffer = _apply_header_notes(buffer, "products", header_notes)
+    buffer = _apply_header_notes(buffer, "do not import", header_notes)
+
 
     return buffer.getvalue(), pd.DataFrame(warnings)
