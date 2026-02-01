@@ -6,6 +6,27 @@ import hashlib
 import pandas as pd
 import re
 
+
+def _read_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
+    """Robust CSV reader for supplier files (encoding + delimiter)."""
+    encodings = ["utf-8-sig", "utf-8", "cp1252", "latin1"]
+    seps = [",", ";", "	"]
+    last_err = None
+    for enc in encodings:
+        for sep in seps:
+            try:
+                return pd.read_csv(io.BytesIO(file_bytes), encoding=enc, sep=sep, dtype=str, keep_default_na=False)
+            except Exception as e:
+                last_err = e
+                continue
+    # final fallback: replace undecodable chars
+    try:
+        return pd.read_csv(io.BytesIO(file_bytes), encoding="cp1252", sep=",", dtype=str, keep_default_na=False, encoding_errors="replace")
+    except Exception as e:
+        last_err = e
+    raise ValueError(f"Impossible de lire le CSV (encodage). Dernière erreur: {last_err}")
+
+
 from suppliers.fournisseur_abc import run_transform as run_abc
 
 st.set_page_config(page_title="Générateur Shopify – Fichiers fournisseurs", layout="wide")
@@ -60,7 +81,7 @@ st.markdown("### 1️⃣ Sélection du fournisseur")
 supplier_name = st.selectbox("Choisir le fournisseur", sorted(SUPPLIERS.keys(), key=lambda x: x.lower()))
 
 st.markdown("### 2️⃣ Upload des fichiers")
-supplier_file = st.file_uploader("Fichier fournisseur (.xlsx)", type=["xlsx"])
+supplier_file = st.file_uploader("Fichier fournisseur (.xlsx ou .csv)", type=["xlsx","csv"])
 help_file = st.file_uploader("Help data (.xlsx)", type=["xlsx"])
 
 
@@ -126,22 +147,54 @@ def _norm(s) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
 
-def _extract_unique_style_rows(xlsx_bytes: bytes, supplier_name: str = "") -> pd.DataFrame | None:
-    """Extract unique styles from the supplier file.
+def _extract_unique_style_rows(file_bytes: bytes, supplier_name: str = "", file_name: str = "") -> pd.DataFrame | None:
+    """Extract unique styles from the supplier file (.xlsx ou .csv).
 
     Returns a dataframe with columns (when available) in this order:
       1) Style Name
       2) Style Number
     """
-    bio = io.BytesIO(xlsx_bytes)
-    xls = pd.ExcelFile(bio)
+    is_csv = str(file_name or "").strip().lower().endswith(".csv")
+    if is_csv:
+        try:
+            df0 = _read_csv_bytes(file_bytes)
+        except Exception:
+            return None
 
+        # Minimal detection (case-insensitive)
+        cols_norm = {str(c).strip().lower(): c for c in df0.columns}
+        style_name_col = cols_norm.get("style name") or cols_norm.get("style_name") or cols_norm.get("style") or cols_norm.get("style name ")
+        style_number_col = cols_norm.get("style number") or cols_norm.get("style no") or cols_norm.get("style code") or cols_norm.get("style #")
+
+        if not style_name_col and not style_number_col:
+            return None
+
+        out = pd.DataFrame()
+        if style_name_col:
+            out["Style Name"] = df0[style_name_col]
+        if style_number_col:
+            out["Style Number"] = df0[style_number_col]
+
+        # Normalize and drop duplicates
+        for c in out.columns:
+            out[c] = out[c].astype(str).str.strip()
+        out = out.drop_duplicates()
+
+        cols = []
+        if "Style Name" in out.columns:
+            cols.append("Style Name")
+        if "Style Number" in out.columns:
+            cols.append("Style Number")
+        return out[cols].reset_index(drop=True)
+
+    bio = io.BytesIO(file_bytes)
+    xls = pd.ExcelFile(bio)
 
     vendor_key = re.sub(r"[\s\-_/]+", "", str(supplier_name or "").strip().lower())
     is_pas = vendor_key in ("pasnormalstudios", "pasnormalstudio")
     # PAS Normal Studios: use only "Summary + Data" like the transformer (ensures correct STYLE NAME)
     if vendor_key in ("pasnormalstudios", "pasnormalstudio") and "Summary + Data" in xls.sheet_names:
-            sheet_names = ["Summary + Data"]
+        sheet_names = ["Summary + Data"]
     else:
         sheet_names = list(xls.sheet_names)
     # Prefer explicit style-number fields (avoid generic "Style" which can match a style-name field in some files)
@@ -271,7 +324,7 @@ def _extract_unique_style_rows(xlsx_bytes: bytes, supplier_name: str = "") -> pd
     return out[cols].reset_index(drop=True)
 
 if supplier_file is not None:
-    style_rows_df = _extract_unique_style_rows(supplier_file.getvalue(), supplier_name)
+    style_rows_df = _extract_unique_style_rows(supplier_file.getvalue(), supplier_name, supplier_file.name)
     if style_rows_df is not None and not style_rows_df.empty:
         st.markdown("#### Seasonality")
 
@@ -401,6 +454,7 @@ if generate:
         with st.spinner("Traitement en cours…"):
             output_bytes, warnings_df = transform_fn(
                 supplier_xlsx_bytes=supplier_file.getvalue(),
+                supplier_filename=supplier_file.name,
                 help_xlsx_bytes=help_file.getvalue(),
                 existing_shopify_xlsx_bytes=(existing_shopify_file.getvalue() if existing_shopify_file is not None else None),
                 vendor_name=supplier_name,
