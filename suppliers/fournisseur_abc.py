@@ -382,6 +382,29 @@ def _norm_handle(v) -> str:
     return s
 
 
+def _remove_size_from_handle(handle: str) -> str:
+    """
+    Supprime toute grandeur À LA FIN du handle.
+    IMPORTANT : agit UNIQUEMENT sur le handle.
+
+    Exemples supprimés :
+    - -xs, -s, -m, -l, -xl, -xxl, -xxxl
+    - -6, -6.5, -10, -10-5, etc.
+    """
+    if not handle:
+        return ""
+
+    h = str(handle).strip().lower()
+
+    # Tailles alpha à la fin
+    h = re.sub(r"-(xs|s|m|l|xl|xxl|xxxl)$", "", h)
+
+    # Tailles numériques à la fin (6, 6.5, 10-5, etc.)
+    h = re.sub(r"-\d+([.-]\d+)?$", "", h)
+
+    return h
+
+
 def _strip_gender_prefix_size(v: str) -> str:
     s = _norm(v)
     if not s:
@@ -527,6 +550,23 @@ def _first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
         if c.lower() in cols:
             return cols[c.lower()]
     return None
+
+def _first_existing_col_with_data(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Return first candidate column that exists AND has at least one non-empty value."""
+    cols = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.lower()
+        if key in cols:
+            col = cols[key]
+            s = df[col]
+            # normalize empties without turning NaN into 'nan'
+            s_clean = s.fillna("").astype(str).str.strip()
+            # treat literal tokens 'nan'/'none' as empty too
+            s_clean = s_clean.replace({r"(?i)^\s*(nan|none)\s*$": ""}, regex=True)
+            if s_clean.ne("").any():
+                return col
+    return None
+
 
 
 # ---------------------------------------------------------
@@ -1232,7 +1272,7 @@ def run_transform(
     size_comment_map = _read_size_reco_map(wb)
 
     # Supplier columns
-    desc_col = _first_existing_col(
+    desc_col = _first_existing_col_with_data(
         sup,
         [
             "Description", "description",
@@ -1408,6 +1448,7 @@ def run_transform(
     sup["_vendor"] = vendor_name
     sup["_brand_choice"] = _norm(brand_choice)
 
+    title_desc_col = None  # init to avoid UnboundLocalError
     # Title: Gender('s) + Description - Color (NON-standardized, Title Cased)
     # -----------------------------------------------------
     # Title rules (kept stable across suppliers)
@@ -1417,6 +1458,7 @@ def run_transform(
     # d) Title Case, ® conserved
     # e) Truncate to max 200 chars
     # -----------------------------------------------------
+    
     def _gender_for_title(g: str) -> str:
         """Title prefix rule:
         - ONLY prefix Women's (ensure it appears for women's products)
@@ -1429,9 +1471,12 @@ def run_transform(
         # Accept common normalized forms (incl. already possessive)
         if ggl in ("women", "womens", "women's", "female", "femme", "femmes"):
             return "Women's"
-        return 
+        return ""
 
-    title_desc_col = _first_existing_col(
+    # Column to use as the primary "name/description" source for Title.
+    # IMPORTANT: even when a column is selected, we still do row-level fallbacks
+    # (ex: MAAP has a Description column but many rows are empty -> fallback to Name per row).
+    title_desc_col = _first_existing_col_with_data(
         sup,
         [
             "Description",
@@ -1441,26 +1486,41 @@ def run_transform(
             "Style Name",
             "Display Name",
             "Online Display Name",
+            "Name",
+            "name",
         ],
     )
 
+    # Safeguard: if selected title column yields all-empty, fallback to Name/name.
+    if title_desc_col is not None:
+        _tmp = _series_str_clean(sup[title_desc_col]).str.strip()
+        if (_tmp.eq("").all()) and ("Name" in sup.columns or "name" in sup.columns):
+            title_desc_col = _first_existing_col_with_data(sup, ["Name", "name"])
 
-    # SATISFY: prefer supplier "name" column for Title (same naming basis as handle/SEO title)
+    # SATISFY: prefer supplier Name/name column for Title (same naming basis as handle/SEO title).
     if vendor_key in ("satisfy",):
         _s_name = _first_existing_col(sup, ["Name", "name"])
         if _s_name:
             title_desc_col = _s_name
-    if title_desc_col is not None:
-        sup["_desc_title_norm"] = _series_str_clean(sup[title_desc_col]).map(_norm).apply(_convert_r_to_registered)
-    # If description is long (>200 chars), use an alternate name column instead of truncating
-    if "_desc_is_long" in sup.columns and "_title_name_raw" in sup.columns:
-        mask_long = sup["_desc_is_long"] & sup["_title_name_raw"].astype(str).str.strip().ne("")
-        sup.loc[mask_long, "_desc_title_norm"] = sup.loc[mask_long, "_title_name_raw"]
-    else:
-        # fallback to the already built SEO description
-        sup["_desc_title_norm"] = _series_str_clean(sup["_desc_seo"])
 
-    # Clean description text used for Title/SEO fields:
+    # Build description text used for Title (normalized, row-wise fallbacks).
+    if title_desc_col is not None:
+        _desc_series = _series_str_clean(sup[title_desc_col]).map(_norm)
+    else:
+        _desc_series = _series_str_clean(sup["_desc_seo"]).map(_norm)
+
+    _name_series = _series_str_clean(sup.get("_title_name_raw", "")).map(_norm)
+
+    # Row-level fallback:
+    # - If original supplier description is long (>200 chars) we use Style Name/Name (already in _title_name_raw).
+    # - Else if the selected description cell is empty, fallback to Style Name/Name.
+    _desc_series = _desc_series.where(_desc_series.astype(str).str.strip().ne(""), _name_series)
+    if "_desc_is_long" in sup.columns:
+        mask_long = sup["_desc_is_long"] & _name_series.astype(str).str.strip().ne("")
+        _desc_series = _desc_series.where(~mask_long, _name_series)
+
+    sup["_desc_title_norm"] = _desc_series.apply(_convert_r_to_registered)
+# Clean description text used for Title/SEO fields:
     # - remove embedded gender markers like -w- / -m-
     # - remove leading Men/Women tokens to avoid duplicates with Gender prefix
     def _clean_desc_for_display(s: str) -> str:
@@ -1521,7 +1581,7 @@ def run_transform(
         ]
         parts = [p for p in parts if p and str(p).strip()]
         return slugify(" ".join(parts))
-    sup["_handle"] = sup.apply(_make_handle, axis=1)
+    sup["_handle"] = sup.apply(_make_handle, axis=1).apply(_remove_size_from_handle)
 
     # Custom Product Type: match using DESCRIPTION (to catch TEE / LONG SLEEVE etc.)
     sup["_product_type"] = sup["_desc_raw"].apply(lambda t: _best_match_product_type(t, product_types))
