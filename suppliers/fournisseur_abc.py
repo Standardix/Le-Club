@@ -1,6 +1,77 @@
 from __future__ import annotations
 
+import re
 
+
+
+def map_custom_product_type(val: str) -> str:
+    """Map supplier product types to Shopify Custom Product Type (case-insensitive)."""
+    if val is None:
+        return val
+    if not isinstance(val, str):
+        val = str(val)
+    v = val.strip().lower()
+
+    mapping = {
+        "gilet": "Vests",
+        "bibs": "Bib Shorts",
+        "long bibs": "Bib Tights",
+        "bidon": "Water Bottle",
+        "baselayer": "Base Layer",
+        # keep existing convention for tees
+        "t-shirt": "T-Shirts",
+        "t shirt": "T-Shirts",
+        "tee": "T-Shirts",
+        "tshirt": "T-Shirts",
+    }
+
+    # Prefer exact match; fallback to contains for common tee variants
+    if v in mapping:
+        return mapping[v]
+
+    # contains-based only for a couple of safe cases
+    if "long bibs" in v:
+        return "Bib Tights"
+    if v.startswith("bibs") or " bibs" in v:
+        return "Bib Shorts"
+    if "t-shirt" in v or "t shirt" in v or " tee" in f" {v}" or "tshirt" in v:
+        return "T-Shirts"
+
+    return val
+
+
+SIZE_REGEX = re.compile(r"""(\s*[-/]?\s*(?:size\s*)?(?:xs|s|m|l|xl|xxl)\b)""", re.IGNORECASE)
+
+def remove_size(text):
+    if not isinstance(text, str):
+        return text
+    return re.sub(SIZE_REGEX, "", text).strip()
+
+
+
+
+def _strip_size_tokens(s: str) -> str:
+    """Remove size tokens (XS/S/M/L/XL/XXL...) from SEO fields without removing letters inside words."""
+    if s is None:
+        return s
+    if not isinstance(s, str):
+        s = str(s)
+
+    out = s
+
+    # Remove parenthesized sizes, e.g. "(M)" or "(size M)"
+    out = re.sub(r"(?i)\(\s*(?:size\s*)?(?:xxs|xs|s|m|l|xl|xxl|xxxl)\s*\)", "", out)
+
+    # Remove size tokens only when preceded by a separator or whitespace (so we don't touch words like "Studios")
+    out = re.sub(r"(?i)(?:\s*[-/]\s*|\s+)(?:size\s*)?(?:xxs|xs|s|m|l|xl|xxl|xxxl)\b", "", out)
+
+    # Cleanup leftover separators/spaces
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    out = re.sub(r"\s+([,;:.])", r"\1", out)
+    out = re.sub(r"[-/]\s*$", "", out).strip()
+    out = re.sub(r"\s*-\s*$", "", out).strip()
+
+    return out
 def _scrub_nan_token_in_title(s: str) -> str:
     """Remove accidental 'nan' tokens that can appear when concatenating missing fields."""
     if s is None:
@@ -150,22 +221,19 @@ except Exception:
 def _build_existing_shopify_index(existing_shopify_xlsx_bytes: bytes | None):
     """Build matching indexes from an existing Shopify product export/list.
 
-    Keys priority (as requested):
-      1) brand + SKU + UPC
-      2) brand + UPC
-      3) brand + SKU
-      4) SKU + UPC
-      5) UPC
+    Matching rule (as requested):
+      * if SKU + UPC : key = SKU|UPC
+      * else UPC : key = UPC
+      * else Vendor + SKU : key = Vendor|SKU
+      * else : no key (do not classify as existing)
 
     Also returns a set of existing handles (normalized).
     """
     handles_set: set[str] = set()
     key_sets = {
-        "brand_sku_upc": set(),
-        "brand_upc": set(),
-        "brand_sku": set(),
-        "sku_upc": set(),
-        "upc": set(),
+        "sku_upc": set(),      # (sku, upc)
+        "upc": set(),          # (upc,)
+        "vendor_sku": set(),   # (vendor, sku)
     }
     if not existing_shopify_xlsx_bytes:
         return handles_set, key_sets
@@ -187,48 +255,40 @@ def _build_existing_shopify_index(existing_shopify_xlsx_bytes: bytes | None):
         if h:
             handles_set.add(h)
 
-        brand = _norm(r.get(vendor_col, "")) if vendor_col else ""
+        vendor = _norm(r.get(vendor_col, "")) if vendor_col else ""
         sku = _norm(r.get(sku_col, "")) if sku_col else ""
         upc = _norm_upc(r.get(upc_col, "")) if upc_col else ""
 
-        if brand and sku and upc:
-            key_sets["brand_sku_upc"].add((brand, sku, upc))
-        if brand and upc:
-            key_sets["brand_upc"].add((brand, upc))
-        if brand and sku:
-            key_sets["brand_sku"].add((brand, sku))
+        # Priority order for keys
         if sku and upc:
             key_sets["sku_upc"].add((sku, upc))
-        if upc:
+        elif upc:
             key_sets["upc"].add((upc,))
+        elif vendor and sku:
+            key_sets["vendor_sku"].add((vendor, sku))
 
     return handles_set, key_sets
 
 
-def _row_is_existing(brand: str, sku: str, upc: str, key_sets) -> bool:
-    """Return True if a row already exists in Shopify.
-
-    IMPORTANT CHANGE (to avoid over-filtering):
-    - We ONLY consider keys that include a UPC/GTIN.
-    - We DO NOT classify as existing based on (brand + SKU) alone.
-      (That rule can incorrectly move an entire ordersheet to "do not import".)
-    """
-    b = _norm(brand)
+def _row_is_existing(vendor: str, sku: str, upc: str, key_sets) -> bool:
+    """Return True if a row already exists in Shopify, following the requested key rules."""
+    v = _norm(vendor)
     s = _norm(sku)
     u = _norm_upc(upc)
 
-    # Strongest matches (include UPC)
-    if b and s and u and (b, s, u) in key_sets["brand_sku_upc"]:
-        return True
-    if b and u and (b, u) in key_sets["brand_upc"]:
-        return True
+    # 1) SKU + UPC
     if s and u and (s, u) in key_sets["sku_upc"]:
         return True
+
+    # 2) UPC only
     if u and (u,) in key_sets["upc"]:
         return True
+
+    # 3) Vendor + SKU
+    if v and s and (v, s) in key_sets["vendor_sku"]:
+        return True
+
     return False
-
-
 def _apply_red_font_for_handle(buffer: io.BytesIO, sheet_name: str, rows_to_color: list[int]) -> io.BytesIO:
     """Color the Handle cell red for the given 0-based row indexes (dataframe rows)."""
     wb = load_workbook(buffer)
@@ -682,6 +742,79 @@ def _read_list_column(wb, sheet_name: str) -> list[str]:
         if s and s.lower() != "nan":
             out.append(s)
     return out
+
+
+
+def _read_product_type_gendered_map(wb, sheet_name: str = "Product Types") -> dict[str, bool]:
+    """Read Product Types sheet to know if a Custom Product Type is gendered.
+
+    Expected sheet structure (as in Help Data):
+      Col A: Custom Product Type
+      Col B: 'Genré' or 'NON Genré' (can be blank)
+
+    Returns a dict[normalized_product_type -> is_gendered_bool].
+
+    Normalization:
+      - lowercased + trimmed
+      - we also add simple singular/plural variants so that:
+          "Water Bottle" (help data) matches "Water Bottles" (output)
+          "Vest" matches "Vests", etc.
+
+    Rules:
+      - If Col B contains 'non' => NON Genré => False
+      - Otherwise => True (keep previous behavior)
+    """
+    if sheet_name not in wb.sheetnames:
+        return {}
+    ws = wb[sheet_name]
+
+    def _norm_pt(x: str) -> str:
+        s = str(x or "").strip().lower()
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _singularize(s: str) -> str:
+        # very small heuristic: Water Bottles -> Water Bottle, Vests -> Vest, etc.
+        t = _norm_pt(s)
+        if t.endswith("s") and len(t) >= 4 and not t.endswith("ss"):
+            return t[:-1]
+        return t
+
+    def _pluralize(s: str) -> str:
+        t = _norm_pt(s)
+        if not t:
+            return t
+        if t.endswith("s"):
+            return t
+        return t + "s"
+
+    m: dict[str, bool] = {}
+    for r in range(2, ws.max_row + 1):
+        pt = ws.cell(row=r, column=1).value
+        flag = ws.cell(row=r, column=2).value
+        if pt is None:
+            continue
+        pt_s = str(pt).strip()
+        if not pt_s or pt_s.lower() == "nan":
+            continue
+
+        flag_s = "" if flag is None else str(flag).strip().lower()
+        # normalize accents (minimal)
+        flag_s = flag_s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("à", "a").replace("ô", "o")
+
+        is_gendered = False if ("non" in flag_s) else True
+
+        base = _norm_pt(pt_s)
+        if not base:
+            continue
+
+        # store base + variants
+        keys = {base, _singularize(base), _pluralize(base), _pluralize(_singularize(base))}
+        for k in keys:
+            if k:
+                m[k] = is_gendered
+
+    return m
 
 
 
@@ -1261,6 +1394,26 @@ def run_transform(
     shopify_cat_rows = _read_category_rows(wb, "Shopify Product Category")
     google_cat_rows = _read_category_rows(wb, "Google Product Category")
     product_types = _read_list_column(wb, "Product Types")
+
+    # Canonical Product Type resolver:
+    # Output Custom Product Type MUST match EXACTLY one value from Help Data -> Product Types (col A).
+    _pt_canon = { _norm_key(pt): pt for pt in (product_types or []) if _norm(pt) }
+
+    def _canon_product_type(pt: str) -> str:
+        s = _norm(pt)
+        if not s:
+            return ""
+        k = _norm_key(s)
+        if k in _pt_canon:
+            return _pt_canon[k]
+        # singular/plural tolerance (only for matching; returns canonical from Help Data)
+        if k.endswith("s") and k[:-1] in _pt_canon:
+            return _pt_canon[k[:-1]]
+        if (k + "s") in _pt_canon:
+            return _pt_canon[k + "s"]
+        return s
+
+    product_type_gendered_map = _read_product_type_gendered_map(wb, "Product Types")
     variant_weight_map = _read_variant_weight_map(wb)
 
 
@@ -1583,8 +1736,64 @@ def run_transform(
         return slugify(" ".join(parts))
     sup["_handle"] = sup.apply(_make_handle, axis=1).apply(_remove_size_from_handle)
 
-    # Custom Product Type: match using DESCRIPTION (to catch TEE / LONG SLEEVE etc.)
+    # Custom Product Type: match using multiple fields (description + title + optional source product type)
+    # This ensures keywords like Gilet/Bibs/Long Bibs/Bidon/Baselayer are detected even if not present in DESCRIPTION.
     sup["_product_type"] = sup["_desc_raw"].apply(lambda t: _best_match_product_type(t, product_types))
+
+    # Optional: use a source product type column from supplier file if present
+    product_type_src_col = _first_existing_col(sup, ["Product Type", "product type", "Type", "Category", "Product category", "Product Category"])
+    sup["_product_type_src_raw"] = ""
+    if product_type_src_col is not None:
+        sup["_product_type_src_raw"] = _series_str_clean(sup[product_type_src_col])
+
+    _pt_blob = (
+        sup.get("_title", "").fillna("") + " " + sup.get("_title_name_raw", "").fillna("") + " " +
+        sup["_desc_raw"].fillna("") + " " +
+        sup["_product_type_src_raw"].fillna("")
+    ).astype(str).str.lower()
+
+    
+
+    # If Custom Product Type is still empty, try matching again using a richer text blob
+    # (Title + Style Name/Name + Description + optional source product type).
+    sup["_product_type"] = sup["_product_type"].where(
+        sup["_product_type"].astype(str).str.strip().ne(""),
+        _pt_blob.apply(lambda t: _best_match_product_type(t, product_types)),
+    )
+# Keyword overrides (case-insensitive) – priority order matters (e.g., "long bibs" before "bibs")
+    sup.loc[_pt_blob.str.contains(r"\blong\s+bibs\b", regex=True), "_product_type"] = _canon_product_type("Bib Tights")
+    sup.loc[_pt_blob.str.contains(r"\bbibs\b", regex=True), "_product_type"] = _canon_product_type("Bib Shorts")
+    sup.loc[_pt_blob.str.contains(r"\bgilet\b", regex=True), "_product_type"] = _canon_product_type("Vests")
+    sup.loc[_pt_blob.str.contains(r"\bbidon\b", regex=True), "_product_type"] = _canon_product_type("Water Bottle")
+    sup.loc[_pt_blob.str.contains(r"\bbaselayer\b", regex=True), "_product_type"] = _canon_product_type("Base Layer")
+    sup.loc[_pt_blob.str.contains(r"\bt[-\s]?shirt\b", regex=True), "_product_type"] = _canon_product_type("T-Shirts")
+    sup.loc[_pt_blob.str.contains(r"\btee\b", regex=True), "_product_type"] = _canon_product_type("T-Shirts")
+    # Final enforcement: always output canonical Product Types from Help Data
+    sup["_product_type"] = sup["_product_type"].apply(_canon_product_type)
+
+
+
+    # -----------------------------------------------------
+    # Product type gendering (Help Data -> Product Types)
+    # -----------------------------------------------------
+    # Default behavior:
+    # - If Custom Product Type is EMPTY -> treat as NON Genré (unknown), so we do NOT force "Men".
+    # - Otherwise: considered "Genré" unless explicitly marked NON Genré in Help Data.
+    sup["_is_gendered"] = sup["_product_type"].apply(
+        lambda pt: product_type_gendered_map.get(str(pt or "").strip().lower(), True) if str(pt or "").strip() else False
+    )
+
+    # Gender to export:
+    # 1) NON Genré -> blank
+    # 2) Genré -> keep existing rule (_gender_std)
+    # 3) Genré but empty -> default to "Men"
+    def _gender_final(r) -> str:
+        if not bool(r.get("_is_gendered", True)):
+            return ""
+        g = _norm(r.get("_gender_std", ""))
+        return g if g else "Men"
+
+    sup["_gender_final"] = sup.apply(_gender_final, axis=1)
 
     # Tags (keep standardized color/gender tags)
     # -----------------------------------------------------
@@ -1610,8 +1819,8 @@ def run_transform(
         else:
             tags.append("Seasonal")
 
-        if r["_gender_std"]:
-            tags.append(r["_gender_std"])
+        if r.get("_is_gendered", True) and r.get("_gender_final", ""):
+            tags.append(r["_gender_final"])
         tags.append("_badge_new")
         if r["_product_type"]:
             tags.append(r["_product_type"])
@@ -1854,7 +2063,9 @@ def run_transform(
     sup["_seo_title"] = sup.apply(_seo_base, axis=1)
 
     sup["_seo_title"] = sup["_seo_title"].apply(_scrub_nan_token_in_title)
-    # SEO Description: RESTORE previous behavior
+    
+    sup["_seo_title"] = sup["_seo_title"].apply(_strip_size_tokens)
+# SEO Description: RESTORE previous behavior
     # Prefix fixe + contenu marque (help data -> SEO Description Brand Part), sinon fallback générique
     def _seo_desc(r):
         prefix = f"Shop the {r['_seo_title']} with free worldwide shipping, and 30-day returns on leclub.cc. "
@@ -2008,7 +2219,7 @@ def run_transform(
     out["Metafield: my_fields.product_features [multi_line_text_field]"] = sup["_product_features"]
     out["Metafield: my_fields.behind_the_brand [multi_line_text_field]"] = sup["_behind_the_brand"]
     out["Metafield: my_fields.size_comment [single_line_text_field]"] = sup["_size_comment"]
-    out["Metafield: my_fields.gender [single_line_text_field]"] = sup["_gender_std"]
+    out["Metafield: my_fields.gender [single_line_text_field]"] = sup["_gender_final"]
 
     out["Metafield: my_fields.colour [single_line_text_field]"] = sup["_color_std"]
     out["Metafield: mm-google-shopping.color"] = sup["_color_std"]
@@ -2017,7 +2228,7 @@ def run_transform(
     out["Metafield: mm-google-shopping.size_system"] = "US"
     out["Metafield: mm-google-shopping.condition"] = "new"
     out["Metafield: mm-google-shopping.google_product_category"] = sup["_google_cat_id"]
-    out["Metafield: mm-google-shopping.gender"] = sup["_gender_std"]
+    out["Metafield: mm-google-shopping.gender"] = sup["_gender_final"]
 
     out["Variant Metafield: mm-google-shopping.mpn"] = sup["_variant_sku"]
     out["Variant Metafield: mm-google-shopping.gtin"] = sup["_barcode"]
@@ -2055,7 +2266,6 @@ def run_transform(
         "SEO Title",
         "SEO Description",
         "Metafield: my_fields.size_comment [single_line_text_field]",
-        "Metafield: my_fields.gender [single_line_text_field]",
         "Metafield: my_fields.colour [single_line_text_field]",
         "Metafield: mm-google-shopping.color",
         "Variant Metafield: mm-google-shopping.size",
@@ -2146,13 +2356,19 @@ def run_transform(
 
         def _getcol(r, c):
             return r.get(c, "") if c else ""
+        handle_col_out = "Handle" if "Handle" in out.columns else None
 
         mask_existing = []
         for _, r in out.iterrows():
-            brand = _getcol(r, vendor_col) or vendor_name
+            vendor = _getcol(r, vendor_col) or vendor_name
             sku = _getcol(r, sku_col)
             upc = _getcol(r, upc_col)
-            mask_existing.append(_row_is_existing(str(brand), str(sku), str(upc), existing_key_sets))
+            handle_val = _getcol(r, handle_col_out)
+            handle_norm = _norm_handle(handle_val) if handle_col_out else ""
+            is_existing = (handle_norm in existing_handles_set) if handle_norm else False
+            if not is_existing:
+                is_existing = _row_is_existing(str(vendor), str(sku), str(upc), existing_key_sets)
+            mask_existing.append(is_existing)
 
         mask_existing = pd.Series(mask_existing, index=out.index)
 
