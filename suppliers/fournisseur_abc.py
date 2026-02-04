@@ -1416,6 +1416,35 @@ def run_transform(
 
     # Standardization
     color_map = _read_2col_map(wb, ["Color Standardization", "Color Variable"])
+    # --- v21 colour inference (base colour from names) ---
+    # Build list of standard colours (Help Data column B values).
+    # Used when supplier colour is not directly mapped (ex: 'Dark Red' -> 'Red' if 'Red' appears as a standalone token).
+    _std_color_terms = []
+    if color_map:
+        _vals = []
+        for _v in color_map.values():
+            _sv = str(_v or "").strip()
+            if _sv and _sv.lower() != "nan":
+                _vals.append(_sv)
+        # unique, keep deterministic order by length desc then alpha
+        _std_color_terms = sorted(set(_vals), key=lambda s: (-len(s), s.lower()))
+
+    def _infer_base_color_from_text(text: str) -> str:
+        """Return a standard colour (from Help Data col B) if found as a whole word/phrase in text."""
+        t = _norm(text)
+        if not t or not _std_color_terms:
+            return ""
+        # Normalize separators so boundaries work consistently
+        t2 = re.sub(r"[\-_/]+", " ", t)
+        for term in _std_color_terms:
+            # Match full word/phrase (case-insensitive); allow flexible separators between words
+            esc = re.escape(term)
+            esc = esc.replace("\\ ", r"[\s\-_/]+")
+            pat = rf"(?i)(?<![A-Za-z0-9]){esc}(?![A-Za-z0-9])"
+            if re.search(pat, t2):
+                return term
+        return ""
+
     size_map = _read_2col_map(wb, ["Size Standardization", "Size Variante"])
     country_map = _read_2col_map(wb, ["Country Abbreviations", "Country of Origin"])
     country_code_map = _build_country_code_map(country_map)
@@ -1611,6 +1640,39 @@ def run_transform(
     # Standardize
     sup["_color_std"] = sup["_color_in"].apply(lambda x: _standardize(x, color_map))
     sup["_color_map_hit"] = sup["_color_in"].apply(lambda x: (str(_norm(x)).lower() in set(color_map.keys())) if color_map else True)
+
+    # v21: If the supplier colour is not mapped, try to infer a base standard colour from text.
+    # Priority of text sources:
+    # 1) Supplier colour columns (Vendor Color / Color / Colour / etc.) when present.
+    # 2) Otherwise, the same name/description sources used for Title.
+    has_color_cols = color_col is not None
+    if _std_color_terms:
+        if has_color_cols:
+            _blob = sup["_color_in"].astype(str)
+        else:
+            _blob = (
+                sup.get("_desc_title_norm", "").fillna("").astype(str) + " " +
+                sup.get("_title_name_raw", "").fillna("").astype(str) + " " +
+                sup.get("_desc_raw", "").fillna("").astype(str)
+            )
+
+        def _try_infer(row):
+            if bool(row.get("_color_map_hit", True)):
+                return row.get("_color_std", ""), True
+            inferred = _infer_base_color_from_text(row.get("_blob", ""))
+            if inferred:
+                return inferred, True
+            return row.get("_color_std", ""), False
+
+        _tmp = pd.DataFrame({
+            "_color_std": sup["_color_std"],
+            "_color_map_hit": sup["_color_map_hit"],
+            "_blob": _blob,
+        })
+
+        inferred_cols = _tmp.apply(lambda r: _try_infer(r), axis=1, result_type="expand")
+        sup["_color_std"] = inferred_cols[0]
+        sup["_color_map_hit"] = inferred_cols[1]
 
     sup["_size_std"] = sup["_size_in"].apply(lambda x: _standardize(x, size_map))
 
