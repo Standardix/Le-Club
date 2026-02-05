@@ -81,7 +81,14 @@ st.markdown("### 1️⃣ Sélection du fournisseur")
 supplier_name = st.selectbox("Choisir le fournisseur", sorted(SUPPLIERS.keys(), key=lambda x: x.lower()))
 
 st.markdown("### 2️⃣ Upload des fichiers")
-supplier_file = st.file_uploader("Fichier fournisseur (.xlsx ou .csv)", type=["xlsx","csv"])
+supplier_file = st.file_uploader("Fichier fournisseur (.xlsx ou .csv)", type=["xlsx","csv","xls"])
+
+# --- Validation format fournisseur ---
+if supplier_file is not None:
+    if supplier_file.name.lower().endswith(".xls"):
+        st.error("Format de fichier non supporté : ce fichier est dans un ancien format Excel (.xls). Veuillez l’enregistrer au format .xlsx, puis le téléverser à nouveau.")
+        st.stop()
+
 help_file = st.file_uploader("Help data (.xlsx)", type=["xlsx"])
 
 
