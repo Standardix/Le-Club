@@ -406,12 +406,12 @@ SHOPIFY_OUTPUT_COLUMNS = [
     "Variant Weight Unit",
     "Cost per item",
     "Status",
-    "Metafield: my_fields.product_use_case [multi_line_text_field]",
-    "Metafield: my_fields.product_features [multi_line_text_field]",
+    "Metafield: product_use_case",
+    "Metafield: product_features",
     "Metafield: behind_the_brand",
-    "Metafield: my_fields.size_comment [single_line_text_field]",
-    "Metafield: my_fields.gender [single_line_text_field]",
-    "Metafield: my_fields.colour [single_line_text_field]",
+    "Metafield: size_comment",
+    "Metafield: gender",
+    "Metafield: colour",
     "Metafield: mm-google-shopping.color",
     "Variant Metafield: mm-google-shopping.size",
     "Metafield: mm-google-shopping.size_system",
@@ -420,11 +420,25 @@ SHOPIFY_OUTPUT_COLUMNS = [
     "Metafield: mm-google-shopping.gender",
     "Variant Metafield: mm-google-shopping.mpn",
     "Variant Metafield: mm-google-shopping.gtin",
-    "Metafield: theme.siblings [single_line_text_field]",
+    "Metafield: theme.siblings",
     "Category: ID",
     "Inventory Available: Boutique",
     "Inventory Available: Le Club",
 ]
+
+
+# ---------------------------------------------------------
+# NORMALISATION DES TITRES DE COLONNES (Shopify strict)
+# ---------------------------------------------------------
+SHOPIFY_HEADER_RENAMES = {
+    "Metafield: product_use_case": "Metafield: product_use_case",
+    "Metafield: product_features": "Metafield: product_features",
+    "Metafield: size_comment": "Metafield: size_comment",
+    "Metafield: gender": "Metafield: gender",
+    "Metafield: colour": "Metafield: colour",
+    "Metafield: theme.siblings": "Metafield: theme.siblings",
+}
+
 
 # ---------------------------------------------------------
 # Helpers
@@ -2508,19 +2522,19 @@ def run_transform(
 
     # Final safety: ensure no <br> or &nbsp; artifacts in text fields
     out["Body (HTML)"] = out["Body (HTML)"].map(_sanitize_text_like_html)
-    out["Metafield: my_fields.product_features [multi_line_text_field]"] = out["Metafield: my_fields.product_features [multi_line_text_field]"].map(_sanitize_text_like_html)
 
     out["Variant Weight Unit"] = "g"
     out["Cost per item"] = sup["_cost"]
     out["Status"] = "draft"
 
-    out["Metafield: my_fields.product_use_case [multi_line_text_field]"] = ""
-    out["Metafield: my_fields.product_features [multi_line_text_field]"] = sup["_product_features"]
+    out["Metafield: product_use_case"] = ""
+    out["Metafield: product_features"] = sup["_product_features"]
+    out["Metafield: product_features"] = out["Metafield: product_features"].map(_sanitize_text_like_html)
     out["Metafield: behind_the_brand"] = sup["_behind_the_brand"]
-    out["Metafield: my_fields.size_comment [single_line_text_field]"] = sup["_size_comment"]
-    out["Metafield: my_fields.gender [single_line_text_field]"] = sup["_gender_final"]
+    out["Metafield: size_comment"] = sup["_size_comment"]
+    out["Metafield: gender"] = sup["_gender_final"]
 
-    out["Metafield: my_fields.colour [single_line_text_field]"] = sup["_color_std"]
+    out["Metafield: colour"] = sup["_color_std"]
     out["Metafield: mm-google-shopping.color"] = sup["_color_std"]
     out["Variant Metafield: mm-google-shopping.size"] = sup["_size_std"].map(_strip_gender_prefix_size)
 
@@ -2532,11 +2546,13 @@ def run_transform(
     out["Variant Metafield: mm-google-shopping.mpn"] = sup["_variant_sku"]
     out["Variant Metafield: mm-google-shopping.gtin"] = sup["_barcode"]
 
-    out["Metafield: theme.siblings [single_line_text_field]"] = sup["_siblings"]
+    out["Metafield: theme.siblings"] = sup["_siblings"]
     out["Category: ID"] = sup["_shopify_cat_id"]
 
     out["Inventory Available: Boutique"] = 0
     out["Inventory Available: Le Club"] = 0
+
+    out = out.rename(columns=SHOPIFY_HEADER_RENAMES)
 
     out = out.reindex(columns=SHOPIFY_OUTPUT_COLUMNS)
     out = out.where(out.notna(), "")
@@ -2565,8 +2581,8 @@ def run_transform(
         "Variant HS Code",
         "SEO Title",
         "SEO Description",
-        "Metafield: my_fields.size_comment [single_line_text_field]",
-        "Metafield: my_fields.colour [single_line_text_field]",
+        "Metafield: size_comment",
+        "Metafield: colour",
         "Metafield: mm-google-shopping.color",
         "Variant Metafield: mm-google-shopping.size",
         "Metafield: mm-google-shopping.google_product_category",
@@ -2726,7 +2742,7 @@ def run_transform(
 
     # Red font for colour metafields when supplier colour was NOT found in Help Data mapping
     color_unmapped_cols = [
-        "Metafield: my_fields.colour [single_line_text_field]",
+        "Metafield: colour",
         "Metafield: mm-google-shopping.color",
     ]
 
@@ -2754,7 +2770,7 @@ def run_transform(
 
     # Red font for multi-colour values (contains "/") on colour columns
     color_cols_multi = [
-        "Metafield: my_fields.colour [single_line_text_field]",
+        "Metafield: colour",
         "Metafield: mm-google-shopping.color",
     ]
     buffer = _apply_red_font_for_color_multi(buffer, "products", color_cols_multi)
@@ -2767,7 +2783,7 @@ def run_transform(
     
     # Red font for gender columns when product is gendered + can be unisex but no explicit Men/Unisex was found in input (manual review)
     gender_review_cols = [
-        "Metafield: my_fields.gender [single_line_text_field]",
+        "Metafield: gender",
         "Metafield: mm-google-shopping.gender",
     ]
 
@@ -2786,11 +2802,11 @@ def run_transform(
         "Title": "ROUGE = Le titre comporte un des deux caractères suivants: ? ou /.",
         "SEO Title": "ROUGE = Le titre comporte un des deux caractères suivants: ? ou /.",
         "Tags": "ROUGE = Assurez-vous que les tags Seasonal sont bien les bons.",
-        "Metafield: my_fields.colour [single_line_text_field]": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
+        "Metafield: colour": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
         "Metafield: mm-google-shopping.color": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
         "Custom Product Type": "Assurez-vous que les catégories trouvées sont bien les bonnes.",
         "Metafield: mm-google-shopping.google_product_category": "Assurez-vous que les catégories trouvées sont bien les bonnes.",
-            "Metafield: my_fields.gender [single_line_text_field]": "ROUGE = Produit genré peut-être unisexe, mais aucune mention claire \"Men\" ou \"Unisex\" n\'a été trouvée dans le fichier d’entrée (validation requise).",
+            "Metafield: gender": "ROUGE = Produit genré peut-être unisexe, mais aucune mention claire \"Men\" ou \"Unisex\" n\'a été trouvée dans le fichier d’entrée (validation requise).",
         "Metafield: mm-google-shopping.gender": "ROUGE = Produit genré peut-être unisexe, mais aucune mention claire \"Men\" ou \"Unisex\" n\'a été trouvée dans le fichier d’entrée (validation requise).",
 }
 
