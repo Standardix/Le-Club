@@ -5,6 +5,7 @@ import time
 import hashlib
 import pandas as pd
 import re
+import os
 
 
 def _read_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
@@ -59,6 +60,39 @@ st.markdown(
 )
 
 st.title("Générateur de fichier Shopify")
+
+# --- Documentation (téléchargements) ---
+
+import os
+
+with st.expander("📘 Documentation"):
+    col1, col2, col_spacer = st.columns([1, 1, 3])
+
+    with col1:
+        if os.path.exists("docs/ReadMe.pdf"):
+            with open("docs/ReadMe.pdf", "rb") as f:
+                st.download_button(
+                    label="📄 Télécharger le guide d'utilisation",
+                    data=f,
+                    file_name="Guide_d'utilisation.pdf",
+                    mime="application/pdf",
+                )
+        else:
+            st.warning("Fichier manquant : ReadMe.pdf")
+
+    with col2:
+        if os.path.exists("docs/Règles en place.pdf"):
+            with open("docs/Règles en place.pdf", "rb") as f:
+                st.download_button(
+                    label="📊 Télécharger les règles des colonnes",
+                    data=f,
+                    file_name="Regles_des_colonnes.pdf",
+                    mime="application/pdf",
+                )
+        else:
+            st.warning("Fichier manquant : Règles en place.pdf")
+
+
 
 SUPPLIERS = {
     "Balmoral": run_abc,
