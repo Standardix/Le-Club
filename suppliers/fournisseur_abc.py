@@ -406,12 +406,12 @@ SHOPIFY_OUTPUT_COLUMNS = [
     "Variant Weight Unit",
     "Cost per item",
     "Status",
-    "Metafield: product_use_case",
-    "Metafield: product_features",
+    "Metafield: my_fields.product_use_case [multi_line_text_field]",
+    "Metafield: my_fields.product_features [multi_line_text_field]",
     "Metafield: behind_the_brand",
-    "Metafield: size_comment",
-    "Metafield: gender",
-    "Metafield: colour",
+    "Metafield: my_fields.size_comment [single_line_text_field]",
+    "Metafield: my_fields.gender [single_line_text_field]",
+    "Metafield: my_fields.colour [single_line_text_field]",
     "Metafield: mm-google-shopping.color",
     "Variant Metafield: mm-google-shopping.size",
     "Metafield: mm-google-shopping.size_system",
@@ -420,25 +420,11 @@ SHOPIFY_OUTPUT_COLUMNS = [
     "Metafield: mm-google-shopping.gender",
     "Variant Metafield: mm-google-shopping.mpn",
     "Variant Metafield: mm-google-shopping.gtin",
-    "Metafield: theme.siblings",
+    "Metafield: theme.siblings [single_line_text_field]",
     "Category: ID",
     "Inventory Available: Boutique",
     "Inventory Available: Le Club",
 ]
-
-
-# ---------------------------------------------------------
-# NORMALISATION DES TITRES DE COLONNES (Shopify strict)
-# ---------------------------------------------------------
-SHOPIFY_HEADER_RENAMES = {
-    "Metafield: product_use_case": "Metafield: product_use_case",
-    "Metafield: product_features": "Metafield: product_features",
-    "Metafield: size_comment": "Metafield: size_comment",
-    "Metafield: gender": "Metafield: gender",
-    "Metafield: colour": "Metafield: colour",
-    "Metafield: theme.siblings": "Metafield: theme.siblings",
-}
-
 
 # ---------------------------------------------------------
 # Helpers
@@ -556,6 +542,17 @@ def _clean_style_key(v) -> str:
     # if Excel treated numeric as float: 123.0 -> 123
     s = re.sub(r"^(\d+)\.0+$", r"\1", s)
     return s
+def _clean_style_number_base(v) -> str:
+    """Normalize a style number the same way as the UX Seasonality table.
+    Example: "11000-FA-SAB" -> "11000".
+    """
+    s = _clean_style_key(v)
+    if not s:
+        return ""
+    # keep only what is before the first "-" (UX behavior)
+    s = re.split(r"[-_]", s, maxsplit=1)[0].strip()
+    return s
+
 
 def _strip_reg_for_handle(s: str) -> str:
     """Handle only: remove ® and (r)/[r] to keep URL safe."""
@@ -704,6 +701,60 @@ def _read_2col_map(wb, sheet_candidates: list[str]) -> dict[str, str]:
             continue
         m[ra.lower()] = rb
     return m
+
+
+def _read_tag_mapping(wb) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Read Help Data sheet 'Tag Mapping'.
+    Expected columns:
+      A: Vendor
+      B: Vendor Tag (to always append when this vendor is selected)
+      D: Custom Product Type (match against output 'Custom Product Type')
+      E: Tag to append
+
+    Returns:
+      (vendor_tag_map, product_type_tag_map) where keys are normalized (lower/trim).
+    """
+    if "Tag Mapping" not in wb.sheetnames:
+        return {}, {}
+    ws = wb["Tag Mapping"]
+
+    vendor_tag_map: dict[str, str] = {}
+    product_type_tag_map: dict[str, str] = {}
+
+    for r in range(2, ws.max_row + 1):
+        vendor = ws.cell(row=r, column=1).value
+        vendor_tag = ws.cell(row=r, column=2).value
+        prod_type = ws.cell(row=r, column=4).value
+        prod_tag = ws.cell(row=r, column=5).value
+
+        v = _norm(vendor)
+        vt = _norm(vendor_tag)
+        pt = _norm(prod_type)
+        ptag = _norm(prod_tag)
+
+        if v and vt and v.lower() not in vendor_tag_map:
+            vendor_tag_map[v.lower()] = vt
+
+        if pt and pt.lower() not in product_type_tag_map:
+            # May be empty/invalid -> we keep it to be able to flag in output styling
+            product_type_tag_map[pt.lower()] = ptag
+
+    return vendor_tag_map, product_type_tag_map
+
+
+def _is_invalid_tag_mapping_value(val: str) -> bool:
+    """Invalid if empty, contains '?', equals 'aucun' (any case), or <3 chars."""
+    s = _norm(val)
+    if not s:
+        return True
+    if "?" in s:
+        return True
+    if s.strip().lower() == "aucun":
+        return True
+    if len(s.strip()) < 3:
+        return True
+    return False
 
 
 def _standardize(val: str, mapping: dict[str, str]) -> str:
@@ -1336,7 +1387,7 @@ def run_transform(
     style_season_map = style_season_map or {}
     vendor_key = _colkey(vendor_name)
     is_satisfy = vendor_key in ("satisfy",)
-    style_season_map = { _clean_style_key(k): v for k, v in style_season_map.items() }
+    style_season_map = { _clean_style_number_base(k): v for k, v in style_season_map.items() }
 
     # -----------------------------------------------------
     # Supplier reader (multi-sheet capable)
@@ -1500,6 +1551,8 @@ def run_transform(
         detected_price_col = _find_col(sup.columns, ["retail price", "retail", "price"])
         detected_cost_col = _find_col(sup.columns, ["wholesale"])
     wb = _load_help_wb(help_xlsx_bytes)
+
+    vendor_tag_map, product_type_tag_map = _read_tag_mapping(wb)
 
     # Standardization
     color_map = _read_2col_map(wb, ["Color Standardization", "Color Variable"])
@@ -2113,19 +2166,28 @@ def run_transform(
     # -----------------------------------------------------
     # Seasonality key (to apply Seasonality Tags per style)
     # -----------------------------------------------------
-    style_num_col = _first_existing_col(sup, ["Style Number", "Style Num", "Style #", "style number", "style #", "Style"])
+    style_num_col = _first_existing_col(sup, ["Style Number", "Style Num", "Style #", "Style No", "Style NO", "STYLE NO", "style no", "style_no", "Style#", "style number", "style #", "Style"])
     style_name_col = _first_existing_col(sup, ["Style Name", "style name",
             "style_name", "STYLE_NAME", "Product Name", "Name"])
     sup["_seasonality_key"] = ""
     if style_num_col is not None:
-        sup["_seasonality_key"] = _series_str_clean(sup[style_num_col]).map(_clean_style_key)
+        sup["_seasonality_key"] = _series_str_clean(sup[style_num_col]).map(_clean_style_number_base)
     elif style_name_col is not None:
-        sup["_seasonality_key"] = _series_str_clean(sup[style_name_col]).map(_clean_style_key)
+        sup["_seasonality_key"] = _series_str_clean(sup[style_name_col]).map(_clean_style_number_base)
 
-    def _make_tags(r):
+    vendor_tag_for_vendor = vendor_tag_map.get(str(vendor_name or "").strip().lower(), "")
+
+    def _make_tags_and_flags(r):
         tags = []
+        invalid_tagmap = False
+
         if r["_vendor"]:
             tags.append(r["_vendor"])
+
+        # Vendor-level tag from Help Data -> Tag Mapping (col B)
+        if vendor_tag_for_vendor:
+            tags.append(vendor_tag_for_vendor)
+
         if r["_color_std"]:
             tags.append(r["_color_std"])
         # Colour-based tags
@@ -2139,7 +2201,17 @@ def run_transform(
         tags.append("_badge_new")
         if r["_product_type"]:
             tags.append(r["_product_type"])
-        # Event/Promotion Related (applies to entire file)
+
+            # Product-type tag from Help Data -> Tag Mapping (col E)
+            pt_key = _norm(r["_product_type"]).lower()
+            if pt_key in product_type_tag_map:
+                mapped = product_type_tag_map.get(pt_key, "")
+                if _is_invalid_tag_mapping_value(mapped):
+                    invalid_tagmap = True
+                else:
+                    tags.append(mapped)
+
+        # Event/Promotion Related (applies to all products)
         if event_promo_tag:
             tags.append(event_promo_tag)
 
@@ -2148,9 +2220,9 @@ def run_transform(
         if stg:
             tags.append(stg)
 
-        return ", ".join([t for t in tags if t])
+        return ", ".join([t for t in tags if t]), invalid_tagmap
 
-    sup["_tags"] = sup.apply(_make_tags, axis=1)
+    sup[["_tags", "_tagmap_invalid"]] = sup.apply(_make_tags_and_flags, axis=1, result_type="expand")
 
     # SKU
     sup["_external_id"] = _series_str_clean(sup[extid_col]).map(_norm) if extid_col else ""
@@ -2522,19 +2594,19 @@ def run_transform(
 
     # Final safety: ensure no <br> or &nbsp; artifacts in text fields
     out["Body (HTML)"] = out["Body (HTML)"].map(_sanitize_text_like_html)
+    out["Metafield: my_fields.product_features [multi_line_text_field]"] = out["Metafield: my_fields.product_features [multi_line_text_field]"].map(_sanitize_text_like_html)
 
     out["Variant Weight Unit"] = "g"
     out["Cost per item"] = sup["_cost"]
     out["Status"] = "draft"
 
-    out["Metafield: product_use_case"] = ""
-    out["Metafield: product_features"] = sup["_product_features"]
-    out["Metafield: product_features"] = out["Metafield: product_features"].map(_sanitize_text_like_html)
+    out["Metafield: my_fields.product_use_case [multi_line_text_field]"] = ""
+    out["Metafield: my_fields.product_features [multi_line_text_field]"] = sup["_product_features"]
     out["Metafield: behind_the_brand"] = sup["_behind_the_brand"]
-    out["Metafield: size_comment"] = sup["_size_comment"]
-    out["Metafield: gender"] = sup["_gender_final"]
+    out["Metafield: my_fields.size_comment [single_line_text_field]"] = sup["_size_comment"]
+    out["Metafield: my_fields.gender [single_line_text_field]"] = sup["_gender_final"]
 
-    out["Metafield: colour"] = sup["_color_std"]
+    out["Metafield: my_fields.colour [single_line_text_field]"] = sup["_color_std"]
     out["Metafield: mm-google-shopping.color"] = sup["_color_std"]
     out["Variant Metafield: mm-google-shopping.size"] = sup["_size_std"].map(_strip_gender_prefix_size)
 
@@ -2546,13 +2618,11 @@ def run_transform(
     out["Variant Metafield: mm-google-shopping.mpn"] = sup["_variant_sku"]
     out["Variant Metafield: mm-google-shopping.gtin"] = sup["_barcode"]
 
-    out["Metafield: theme.siblings"] = sup["_siblings"]
+    out["Metafield: theme.siblings [single_line_text_field]"] = sup["_siblings"]
     out["Category: ID"] = sup["_shopify_cat_id"]
 
     out["Inventory Available: Boutique"] = 0
     out["Inventory Available: Le Club"] = 0
-
-    out = out.rename(columns=SHOPIFY_HEADER_RENAMES)
 
     out = out.reindex(columns=SHOPIFY_OUTPUT_COLUMNS)
     out = out.where(out.notna(), "")
@@ -2565,6 +2635,8 @@ def run_transform(
     # Internal flag for styling (not exported)
     out["OUT_COLOR_HIT"] = sup.get("_color_map_hit", True)
     out["OUT_GENDER_REVIEW"] = sup.get("OUT_GENDER_REVIEW", False)
+    out["OUT_TAGMAP_INVALID"] = sup.get("_tagmap_invalid", False)
+
 
 
     # Yellow rules
@@ -2581,8 +2653,8 @@ def run_transform(
         "Variant HS Code",
         "SEO Title",
         "SEO Description",
-        "Metafield: size_comment",
-        "Metafield: colour",
+        "Metafield: my_fields.size_comment [single_line_text_field]",
+        "Metafield: my_fields.colour [single_line_text_field]",
         "Metafield: mm-google-shopping.color",
         "Variant Metafield: mm-google-shopping.size",
         "Metafield: mm-google-shopping.google_product_category",
@@ -2628,6 +2700,46 @@ def run_transform(
         wb.save(out)
         out.seek(0)
         return out
+
+    def _apply_red_fill_for_tags_tagmap_invalid(buffer: io.BytesIO, sheet_name: str, rows_0based: list[int]) -> io.BytesIO:
+        """Apply RED background fill on the Tags cell for Tag Mapping invalid rows.
+        If the cell font is already red (ex: Seasonal rule), switch to WHITE so it's readable.
+        """
+        buffer.seek(0)
+        wb = openpyxl.load_workbook(buffer)
+        if sheet_name not in wb.sheetnames:
+            return buffer
+        ws = wb[sheet_name]
+
+        # Find Tags column index from header row (row 1)
+        tags_col_idx = None
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=1, column=c).value
+            if str(v).strip() == "Tags":
+                tags_col_idx = c
+                break
+        if tags_col_idx is None:
+            return buffer
+
+        white_font = openpyxl.styles.Font(color="FFFFFFFF")
+
+        for df_i in rows_0based or []:
+            excel_row = df_i + 2
+            cell = ws.cell(row=excel_row, column=tags_col_idx)
+            cell.fill = RED_FILL
+
+            try:
+                rgb = getattr(getattr(cell.font, "color", None), "rgb", None)
+                if rgb and str(rgb).upper().endswith("FF0000"):
+                    cell.font = white_font
+            except Exception:
+                pass
+
+        outb = io.BytesIO()
+        wb.save(outb)
+        outb.seek(0)
+        return outb
+
     def _apply_red_font_for_color_multi(buffer: io.BytesIO, sheet_name: str, cols: list[str]) -> io.BytesIO:
         """Apply red font to specified columns when the cell contains '/' (ex: multi-colour)."""
         buffer.seek(0)
@@ -2725,6 +2837,16 @@ def run_transform(
     buffer = _apply_red_font_for_tags(buffer, "products", _rows_to_color_for_df(products_df))
     buffer = _apply_red_font_for_tags(buffer, "do not import", _rows_to_color_for_df(do_not_import_df))
 
+    # Red fill for Tags when Tag Mapping indicates missing/invalid tag (Help Data -> Tag Mapping col E)
+    def _rows_tagmap_invalid(df_slice: pd.DataFrame) -> list[int]:
+        if "OUT_TAGMAP_INVALID" not in df_slice.columns:
+            return []
+        mask = df_slice["OUT_TAGMAP_INVALID"].astype(bool)
+        return [i for i, v in enumerate(mask.tolist()) if v]
+
+    buffer = _apply_red_fill_for_tags_tagmap_invalid(buffer, "products", _rows_tagmap_invalid(products_df))
+    buffer = _apply_red_fill_for_tags_tagmap_invalid(buffer, "do not import", _rows_tagmap_invalid(do_not_import_df))
+
     buffer = _apply_yellow_for_empty(buffer, "products", yellow_if_empty_cols)
     buffer = _apply_yellow_for_empty(buffer, "do not import", yellow_if_empty_cols)
     # Red font for Title when it contains "?" or "/" (needs manual review)
@@ -2742,7 +2864,7 @@ def run_transform(
 
     # Red font for colour metafields when supplier colour was NOT found in Help Data mapping
     color_unmapped_cols = [
-        "Metafield: colour",
+        "Metafield: my_fields.colour [single_line_text_field]",
         "Metafield: mm-google-shopping.color",
     ]
 
@@ -2770,7 +2892,7 @@ def run_transform(
 
     # Red font for multi-colour values (contains "/") on colour columns
     color_cols_multi = [
-        "Metafield: colour",
+        "Metafield: my_fields.colour [single_line_text_field]",
         "Metafield: mm-google-shopping.color",
     ]
     buffer = _apply_red_font_for_color_multi(buffer, "products", color_cols_multi)
@@ -2783,7 +2905,7 @@ def run_transform(
     
     # Red font for gender columns when product is gendered + can be unisex but no explicit Men/Unisex was found in input (manual review)
     gender_review_cols = [
-        "Metafield: gender",
+        "Metafield: my_fields.gender [single_line_text_field]",
         "Metafield: mm-google-shopping.gender",
     ]
 
@@ -2801,12 +2923,12 @@ def run_transform(
         "Handle": "ROUGE = Le handle existe déjà dans le fichier d’inventaire fourni.",
         "Title": "ROUGE = Le titre comporte un des deux caractères suivants: ? ou /.",
         "SEO Title": "ROUGE = Le titre comporte un des deux caractères suivants: ? ou /.",
-        "Tags": "ROUGE = Assurez-vous que les tags Seasonal sont bien les bons.",
-        "Metafield: colour": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
+        "Tags": "ROUGE = Vérifiez les tags Seasonal et les tags issus du Tag Mapping (col E vide/?/AUCUN/<3).",
+        "Metafield: my_fields.colour [single_line_text_field]": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
         "Metafield: mm-google-shopping.color": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
         "Custom Product Type": "Assurez-vous que les catégories trouvées sont bien les bonnes.",
         "Metafield: mm-google-shopping.google_product_category": "Assurez-vous que les catégories trouvées sont bien les bonnes.",
-            "Metafield: gender": "ROUGE = Produit genré peut-être unisexe, mais aucune mention claire \"Men\" ou \"Unisex\" n\'a été trouvée dans le fichier d’entrée (validation requise).",
+            "Metafield: my_fields.gender [single_line_text_field]": "ROUGE = Produit genré peut-être unisexe, mais aucune mention claire \"Men\" ou \"Unisex\" n\'a été trouvée dans le fichier d’entrée (validation requise).",
         "Metafield: mm-google-shopping.gender": "ROUGE = Produit genré peut-être unisexe, mais aucune mention claire \"Men\" ou \"Unisex\" n\'a été trouvée dans le fichier d’entrée (validation requise).",
 }
 
