@@ -1,36 +1,57 @@
+
 import streamlit as st
 import io
-import openpyxl
 import time
 import hashlib
 import pandas as pd
 import re
-import os
+
+from suppliers.fournisseur_abc import run_transform as run_abc
 
 
 def _read_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
     """Robust CSV reader for supplier files (encoding + delimiter)."""
     encodings = ["utf-8-sig", "utf-8", "cp1252", "latin1"]
-    seps = [",", ";", "	"]
+    seps = [",", ";", "\t"]
     last_err = None
     for enc in encodings:
         for sep in seps:
             try:
-                return pd.read_csv(io.BytesIO(file_bytes), encoding=enc, sep=sep, dtype=str, keep_default_na=False)
+                return pd.read_csv(
+                    io.BytesIO(file_bytes),
+                    encoding=enc,
+                    sep=sep,
+                    dtype=str,
+                    keep_default_na=False,
+                )
             except Exception as e:
                 last_err = e
                 continue
     # final fallback: replace undecodable chars
     try:
-        return pd.read_csv(io.BytesIO(file_bytes), encoding="cp1252", sep=",", dtype=str, keep_default_na=False, encoding_errors="replace")
+        return pd.read_csv(
+            io.BytesIO(file_bytes),
+            encoding="cp1252",
+            sep=",",
+            dtype=str,
+            keep_default_na=False,
+            encoding_errors="replace",
+        )
     except Exception as e:
         last_err = e
     raise ValueError(f"Impossible de lire le CSV (encodage). Dernière erreur: {last_err}")
 
 
-from suppliers.fournisseur_abc import run_transform as run_abc
-
 st.set_page_config(page_title="Générateur Shopify – Fichiers fournisseurs", layout="wide")
+
+# Make forms visually invisible (no border/box/padding) — keeps the "commit on submit" behavior without a box
+st.markdown(
+    """<style>
+    div[data-testid="stForm"] { border: none !important; padding: 0 !important; background: transparent !important; }
+    div[data-testid="stForm"] > div { padding: 0 !important; }
+    </style>""",
+    unsafe_allow_html=True,
+)
 
 # --- CSS bouton (normal + hover) ---
 st.markdown(
@@ -61,106 +82,112 @@ st.markdown(
 
 st.title("Générateur de fichier Shopify")
 
-# --- Documentation (téléchargements) ---
-
-import os
-
-with st.expander("📘 Documentation"):
-    col1, col2, col_spacer = st.columns([1, 1, 3])
-
-    with col1:
-        if os.path.exists("docs/ReadMe.pdf"):
-            with open("docs/ReadMe.pdf", "rb") as f:
-                st.download_button(
-                    label="📄 Télécharger le guide d'utilisation",
-                    data=f,
-                    file_name="Guide_d'utilisation.pdf",
-                    mime="application/pdf",
-                )
-        else:
-            st.warning("Fichier manquant : ReadMe.pdf")
-
-    with col2:
-        if os.path.exists("docs/Règles en place.pdf"):
-            with open("docs/Règles en place.pdf", "rb") as f:
-                st.download_button(
-                    label="📊 Télécharger les règles des colonnes",
-                    data=f,
-                    file_name="Regles_des_colonnes.pdf",
-                    mime="application/pdf",
-                )
-        else:
-            st.warning("Fichier manquant : Règles en place.pdf")
-
-
-
 SUPPLIERS = {
+    "": run_abc,
+    "Aesop": run_abc,
+    "Alba Optics": run_abc,
+    "ARC": run_abc,
     "Balmoral": run_abc,
     "Bandit": run_abc,
+    "Books": run_abc,
+    "Burgh": run_abc,
+    "Cadence": run_abc,
     "Café du Cycliste": run_abc,
     "Ciele": run_abc,
+    "Daysaver": run_abc,
     "District Vision": run_abc,
+    "DUSK": run_abc,
+    "Endorf": run_abc,
     "Fingerscrossed": run_abc,
+    "Hammerhead": run_abc,
+    "Hermanos Koumori": run_abc,
+    "Human Essentials": run_abc,
+    "Jason Markk": run_abc,
+    "KASK": run_abc,
+    "Ketone-IQ": run_abc,
+    "Koa": run_abc,
+    "KOO": run_abc,
+    "Le Braquet": run_abc,
+    "Look": run_abc,
     "MAAP": run_abc,
+    "Maurten": run_abc,
+    "Näak": run_abc,
+    "Neatcleats": run_abc,
     "norda": run_abc,
+    "Oakley": run_abc,
     "Pas Normal Studios": run_abc,
+    "PB Swiss": run_abc,
+    "Post Carry Co.": run_abc,
+    "QUOC": run_abc,
     "Rapha": run_abc,
-    "Soar": run_abc,
-    "Tracksmith": run_abc,
+    "Salt & Stone": run_abc,
     "Satisfy": run_abc,
-
+    "Silca": run_abc,
+    "Skratch Labs": run_abc,
+    "Soar": run_abc,
+    "Sweet Protection": run_abc,
+    "Thule": run_abc,
+    "tons": run_abc,
+    "Tracksmith": run_abc,
+    "Upika": run_abc,
+    "Veloskin": run_abc,
+    "veloToze": run_abc,
+    "Watrbodl": run_abc,
+    "Xact Nutrition": run_abc,
 }
 
 st.markdown("### 1️⃣ Sélection du fournisseur")
-supplier_name = st.selectbox("Choisir le fournisseur", sorted(SUPPLIERS.keys(), key=lambda x: x.lower()))
+supplier_name = st.selectbox("Choisir le fournisseur", list(SUPPLIERS.keys()))
 
 st.markdown("### 2️⃣ Upload des fichiers")
-supplier_file = st.file_uploader("Fichier fournisseur (.xlsx ou .csv)", type=["xlsx","csv","xls"])
+supplier_file = st.file_uploader("Fichier fournisseur (.xlsx ou .csv)", type=["xlsx", "csv", "xls"])
 
 # --- Validation format fournisseur ---
-if supplier_file is not None:
-    if supplier_file.name.lower().endswith(".xls"):
-        st.error("Format de fichier non supporté : ce fichier est dans un ancien format Excel (.xls). Veuillez l’enregistrer au format .xlsx, puis le téléverser à nouveau.")
-        st.stop()
+if supplier_file is not None and supplier_file.name.lower().endswith(".xls"):
+    st.error(
+        "Format de fichier non supporté : ce fichier est dans un ancien format Excel (.xls). "
+        "Veuillez l’enregistrer au format .xlsx, puis le téléverser à nouveau."
+    )
+    st.stop()
 
 help_file = st.file_uploader("Help data (.xlsx)", type=["xlsx"])
-
-
 existing_shopify_file = st.file_uploader("Fichier de produits existant dans Shopify (.xlsx)", type=["xlsx"])
-st.markdown("### 3️⃣ Tags")
 
+st.markdown("### 3️⃣ Tags")
 event_promo_tag = st.selectbox(
     "Event/Promotion Related",
     options=["", "spring-summer", "fall-winter"],
     index=0,
 )
 
-style_season_map: dict[str, str] = {}
+# 🔹 Projet pilote : pas de sélection de marque
+brand_choice = ""
 
+# -------------------------
+# Helpers Seasonality
+# -------------------------
 def _clean_style_key(v) -> str:
     s = " ".join(str(v or "").strip().split())
     # if Excel treated numeric as float: 123.0 -> 123
     s = re.sub(r"^(\d+)\.0+$", r"\1", s)
     return s
 
+
 def _clean_style_number_base(v) -> str:
     """
-    Seasonality UX: keep only what is BEFORE the first hyphen.
-    Example: 11000-FA-SAB -> 11000
+    Normalize style numbers to a base key for seasonality matching/dedup.
+    - Keep only what is BEFORE the first '-' or '_' (covers MAAP suffixes and similar).
+      Example: 11000-FA-SAB -> 11000
+      Example: MAUB0200325_BLAK -> MAUB0200325
     """
     s = _clean_style_key(v)
     if not s:
         return ""
-    return s.split("-", 1)[0].strip()
+    return re.split(r"[-_]", s, maxsplit=1)[0].strip()
+
 
 def _first_existing_col(cols: list[str], candidates: list[str]) -> str | None:
-    """
-    Robust column matcher:
-    - strip surrounding whitespace
-    - collapse internal whitespace
-    - case-insensitive
-    - fallback to contains match
-    """
+    """Robust column matcher (case-insensitive + contains fallback)."""
     def norm(x: str) -> str:
         s = str(x or "")
         s = re.sub(r"\s+", " ", s).strip().lower()
@@ -183,42 +210,59 @@ def _first_existing_col(cols: list[str], candidates: list[str]) -> str | None:
     return None
 
 
-def _norm(s) -> str:
-    """Normalize cell text for display (keep content, just collapse whitespace)."""
+def _norm_cell(s) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
+def _find_style_name_col(cols: list[str]) -> str | None:
+    """Prefer the supplier's real 'Style Name' column when it exists."""
+    def norm(x: str) -> str:
+        return re.sub(r"\s+", " ", str(x or "")).strip().lower()
+
+    for c in cols:
+        nc = norm(c)
+        if nc in ("style name", "stylename", "style_name", "style-name"):
+            return c
+        if nc.startswith("style name"):
+            return c
+    return None
 
 
 def _extract_unique_style_rows(file_bytes: bytes, supplier_name: str = "", file_name: str = "") -> pd.DataFrame | None:
     """Extract unique styles from the supplier file (.xlsx ou .csv).
-
     Returns a dataframe with columns (when available) in this order:
       1) Style Name
       2) Style Number
     """
     is_csv = str(file_name or "").strip().lower().endswith(".csv")
+
+    # -------- CSV --------
     if is_csv:
         try:
             df0 = _read_csv_bytes(file_bytes)
         except Exception:
             return None
 
-        # Minimal detection (case-insensitive)
         cols_norm = {str(c).strip().lower(): c for c in df0.columns}
-        style_name_col = cols_norm.get("style name") or cols_norm.get("style_name") or cols_norm.get("style") or cols_norm.get("style name ")
-        style_number_col = cols_norm.get("style number") or cols_norm.get("style no") or cols_norm.get("style code") or cols_norm.get("style #")
+        style_name_col = cols_norm.get("style name") or cols_norm.get("style_name") or cols_norm.get("style")
+        style_number_col = (
+            cols_norm.get("style number")
+            or cols_norm.get("style no")
+            or cols_norm.get("style code")
+            or cols_norm.get("style #")
+            or cols_norm.get("style_number")
+        )
 
         if not style_name_col and not style_number_col:
             return None
 
         out = pd.DataFrame()
         if style_name_col:
-            out["Style Name"] = df0[style_name_col]
+            out["Style Name"] = df0[style_name_col].map(_norm_cell)
         if style_number_col:
-            out["Style Number"] = df0[style_number_col]
+            out["Style Number"] = df0[style_number_col].map(_clean_style_number_base)
 
-        # Normalize and drop duplicates
-        for c in out.columns:
-            out[c] = out[c].astype(str).str.strip()
+        # drop duplicates
         out = out.drop_duplicates()
 
         cols = []
@@ -228,48 +272,34 @@ def _extract_unique_style_rows(file_bytes: bytes, supplier_name: str = "", file_
             cols.append("Style Number")
         return out[cols].reset_index(drop=True)
 
-    bio = io.BytesIO(file_bytes)
-    xls = pd.ExcelFile(bio)
+    # -------- XLSX --------
+    try:
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    except Exception:
+        return None
 
     vendor_key = re.sub(r"[\s\-_/]+", "", str(supplier_name or "").strip().lower())
     is_pas = vendor_key in ("pasnormalstudios", "pasnormalstudio")
-    # PAS Normal Studios: use only "Summary + Data" like the transformer (ensures correct STYLE NAME)
-    if vendor_key in ("pasnormalstudios", "pasnormalstudio") and "Summary + Data" in xls.sheet_names:
+
+    # PAS Normal Studios: use only "Summary + Data" like the transformer
+    if is_pas and "Summary + Data" in xls.sheet_names:
         sheet_names = ["Summary + Data"]
     else:
         sheet_names = list(xls.sheet_names)
-    # Prefer explicit style-number fields (avoid generic "Style" which can match a style-name field in some files)
+
     style_number_candidates = [
         "Style NO", "Style No", "STYLE NO", "style no",
-        "Style Number", "Style Num", "Style #", "style number", "style #",
+        "Style Number", "Style Num", "Style #", "style number", "style #", "style_number",
         "Style Code", "style code",
-    ]
-    style_name_candidates = [
-        "STYLE NAME", "Style Name", "Style name", "style name",
-        "Product Name", "Name",
     ]
 
     rows: list[pd.DataFrame] = []
     for sheet in sheet_names:
         try:
             df = pd.read_excel(xls, sheet_name=sheet)
-
-            # PAS: Force the supplier column "STYLE NAME" as the source for Style Name (when present)
-            if is_pas:
-                def _find_pas_style_name(cols: list[str]) -> str | None:
-                    def norm(x: str) -> str:
-                        return re.sub(r"\s+", " ", str(x or "")).strip().lower()
-                    for c in cols:
-                        if norm(c) == "style name":
-                            return c
-                    return None
-
-                pas_style_name_col = _find_pas_style_name(list(df.columns))
-                if pas_style_name_col:
-                    # Override candidate list so we never match other "...NAME" columns (ex: STYLE COLOR NAME)
-                    style_name_candidates = [pas_style_name_col]
         except Exception:
             continue
+
         if df is None or df.empty:
             continue
 
@@ -286,49 +316,30 @@ def _extract_unique_style_rows(file_bytes: bytes, supplier_name: str = "", file_
                     continue
 
         num_col = _first_existing_col(list(df.columns), style_number_candidates)
-        # Style Name: STRICT priority on the real supplier column (avoid matching Product Name / Name)
-        def _find_style_name_col(cols: list[str]) -> str | None:
-            def norm(x: str) -> str:
-                return re.sub(r"\s+", " ", str(x or "")).strip().lower()
-            for c in cols:
-                nc = norm(c)
-                if nc in ("style name", "stylename", "style_name"):
-                    return c
-                if nc.startswith("style name"):
-                    return c
-            return None
-        # GLOBAL RULE: if a supplier column "Style Name" exists, ALWAYS use it for UX Style Name.
-        def _find_style_name_col(cols: list[str]) -> str | None:
-            def norm(x: str) -> str:
-                # collapse whitespace and lowercase for robust matching
-                return re.sub(r"\s+", " ", str(x or "")).strip().lower()
-            for c in cols:
-                nc = norm(c)
-                # accept common variants
-                if nc in ("style name", "stylename", "style_name", "style-name"):
-                    return c
-                if nc.startswith("style name"):
-                    return c
-            return None
 
+        # Prefer true Style Name column; fallback only if not present
         name_col = _find_style_name_col(list(df.columns))
         if not name_col:
-            # fallback ONLY when Style Name truly not present
             name_col = _first_existing_col(list(df.columns), ["Product Name", "Name", "Title", "Description"])
 
         if not num_col and not name_col:
             continue
 
-        data = {}
+        data: dict[str, pd.Series] = {}
         if name_col:
-            pass
-        data["Style Name"] = df[name_col].astype(str).fillna("").map(_norm)
+            data["Style Name"] = df[name_col].astype(str).fillna("").map(_norm_cell)
         if num_col:
             data["Style Number"] = df[num_col].map(_clean_style_number_base)
 
         tmp = pd.DataFrame(data)
+
+        # Remove fully empty rows
         for c in tmp.columns:
-            tmp = tmp[tmp[c].astype(str).str.strip().ne("").fillna(False)]
+            tmp[c] = tmp[c].astype(str).str.strip()
+        mask_any = pd.Series(False, index=tmp.index)
+        for c in tmp.columns:
+            mask_any = mask_any | tmp[c].ne("")
+        tmp = tmp.loc[mask_any].copy()
 
         if not tmp.empty:
             rows.append(tmp)
@@ -337,13 +348,15 @@ def _extract_unique_style_rows(file_bytes: bytes, supplier_name: str = "", file_
         return None
 
     out = pd.concat(rows, ignore_index=True).drop_duplicates()
-    # De-duplicate by Style Number ONLY (one row per style).
-    # If multiple Style Name values exist for the same Style Number in the supplier file,
-    # keep the most frequent value FROM THE ACTUAL "Style Name" column.
-    if "Style Number" in out.columns and "Style Name" in out.columns:
-        out["Style Number"] = out["Style Number"].astype(str).str.strip()
+
+    # De-duplicate: one row per base Style Number, with most frequent Style Name
+    if "Style Number" in out.columns:
+        out["Style Number"] = out["Style Number"].astype(str).map(_clean_style_number_base).str.strip()
+
+    if "Style Name" in out.columns:
         out["Style Name"] = out["Style Name"].astype(str).str.strip()
 
+    if "Style Number" in out.columns and "Style Name" in out.columns:
         def mode_nonempty(s: pd.Series) -> str:
             s = s.dropna().astype(str).str.strip()
             s = s[s.ne("")]
@@ -352,9 +365,9 @@ def _extract_unique_style_rows(file_bytes: bytes, supplier_name: str = "", file_
             return s.value_counts().index[0]
 
         agg = out.groupby("Style Number")["Style Name"].apply(mode_nonempty).reset_index()
-        out = agg
-
-
+        out = agg.drop_duplicates(subset=["Style Number"])
+    else:
+        out = out.drop_duplicates()
 
     cols = []
     if "Style Name" in out.columns:
@@ -364,13 +377,22 @@ def _extract_unique_style_rows(file_bytes: bytes, supplier_name: str = "", file_
 
     return out[cols].reset_index(drop=True)
 
+
+# -------------------------
+# Seasonality UI
+# -------------------------
+seasonality_ui_shown = False
+generate_clicked = False
+style_season_map: dict[str, str] = {}
+
 if supplier_file is not None:
     style_rows_df = _extract_unique_style_rows(supplier_file.getvalue(), supplier_name, supplier_file.name)
+
     if style_rows_df is not None and not style_rows_df.empty:
         st.markdown("#### Seasonality")
+        seasonality_ui_shown = True
 
         key_col = "Style Number" if "Style Number" in style_rows_df.columns else "Style Name"
-        # Stabilize ordering so the fingerprint doesn't change between reruns
         style_rows_df = style_rows_df.sort_values(by=key_col).reset_index(drop=True)
 
         supplier_fp = hashlib.md5(supplier_file.getvalue()).hexdigest()
@@ -382,78 +404,98 @@ if supplier_file is not None:
         if st.session_state.get("seasonality_fp") != fp:
             st.session_state["seasonality_fp"] = fp
 
-            # preserve prior entries from stored df (not widget key)
             prev = st.session_state.get("seasonality_df")
             prev_map = {}
-            if prev is not None and isinstance(prev, pd.DataFrame) and key_col in prev.columns and "Seasonality Tags" in prev.columns:
+            if (
+                prev is not None
+                and isinstance(prev, pd.DataFrame)
+                and key_col in prev.columns
+                and "Seasonality Tags" in prev.columns
+            ):
                 prev_map = {
                     _clean_style_key(k): str(v).strip()
-                    for k, v in zip(prev[key_col].astype(str), prev['Seasonality Tags'].astype(str))
+                    for k, v in zip(prev[key_col].astype(str), prev["Seasonality Tags"].astype(str))
                     if _clean_style_key(k)
                 }
 
             init_df = style_rows_df.copy()
-            init_df["Seasonality Tags"] = init_df[key_col].astype(str).map(lambda k: prev_map.get(_clean_style_key(k), ""))
+            init_df["Seasonality Tags"] = init_df[key_col].astype(str).map(
+                lambda k: prev_map.get(_clean_style_key(k), "")
+            )
             st.session_state["seasonality_df"] = init_df
 
-            # Reset the widget state so it reloads the new dataframe cleanly
+            # Reset widget state so it reloads cleanly
             if widget_key in st.session_state:
                 del st.session_state[widget_key]
 
-        # Safety: ensure df exists
+        # Safety
         if "seasonality_df" not in st.session_state or st.session_state["seasonality_df"] is None:
             tmp = style_rows_df.copy()
             tmp["Seasonality Tags"] = ""
             st.session_state["seasonality_df"] = tmp
 
-            st.session_state["seasonality_fp"] = fp
+        edited_df = None
 
-            # reset widget state only on change
-            if "seasonality_editor" in st.session_state:
-                del st.session_state["seasonality_editor"]
+        # Collage rapide : remplir plusieurs styles avec le même tag (sans casser le data_editor)
+        with st.expander("Collage rapide (Seasonality)", expanded=False):
+            c1, c2 = st.columns([2, 3])
+            fill_value = c1.text_input(
+                "Remplir avec",
+                value="",
+                placeholder="ex: ss2025, spring-summer, fall-winter…",
+                key="seasonality_fill_value",
+            )
+            style_options = st.session_state["seasonality_df"][key_col].astype(str).tolist()
+            styles_to_fill = c2.multiselect(
+                "Styles à remplir",
+                options=style_options,
+                default=[],
+                key="seasonality_styles_to_fill",
+            )
+            apply_fill = st.button("Appliquer aux styles sélectionnés", key="seasonality_apply_fill")
+            if apply_fill:
+                if not fill_value.strip():
+                    st.warning("Veuillez saisir une valeur dans \"Remplir avec\".")
+                elif not styles_to_fill:
+                    st.warning("Veuillez sélectionner au moins un style.")
+                else:
+                    df_tmp = st.session_state["seasonality_df"].copy()
+                    df_tmp.loc[df_tmp[key_col].astype(str).isin([str(s) for s in styles_to_fill]), "Seasonality Tags"] = fill_value.strip()
+                    st.session_state["seasonality_df"] = df_tmp
+                    # Force le data_editor à se rafraîchir avec les nouvelles valeurs
+                    if widget_key in st.session_state:
+                        del st.session_state[widget_key]
+                    st.rerun()
 
-            prev = st.session_state.get("seasonality_df")
-            prev_map = {}
-            if prev is not None and key_col in prev.columns and "Seasonality Tags" in prev.columns:
-                prev_map = {
-                    _clean_style_key(k): str(v or "").strip()
-                    for k, v in zip(prev[key_col], prev["Seasonality Tags"])
-                    if _clean_style_key(k)
-                }
+        with st.form("seasonality_form", clear_on_submit=False):
+            edited_df = st.data_editor(
+                st.session_state["seasonality_df"],
+                key=widget_key,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                column_config={
+                    "Style Name": st.column_config.TextColumn(disabled=True),
+                    "Style Number": st.column_config.TextColumn(disabled=True),
+                    "Seasonality Tags": st.column_config.TextColumn(
+                        help="Champ libre (ex: spring-summer, fall-winter, core, etc.)",
+                        required=False,
+                    ),
+                },
+            )
+            # Single action: submit = generate (also commits last edited cell)
+            generate_clicked = st.form_submit_button(
+                "Générer le fichier Shopify",
+                type="secondary",
+                disabled=not (supplier_file and help_file),
+            )
 
-            init_df = style_rows_df.copy()
-            init_df["Seasonality Tags"] = init_df[key_col].map(lambda k: prev_map.get(_clean_style_key(k), ""))
-            st.session_state["seasonality_df"] = init_df
+        # Persist latest edits (prevents the 'type twice' issue)
+        if isinstance(edited_df, pd.DataFrame):
+            st.session_state["seasonality_df"] = edited_df
 
-        # guard
-        if "seasonality_df" not in st.session_state or st.session_state["seasonality_df"] is None:
-            tmp = style_rows_df.copy()
-            tmp["Seasonality Tags"] = ""
-            st.session_state["seasonality_df"] = tmp
+        current_df = st.session_state["seasonality_df"]
 
-        edited_df = st.data_editor(
-            st.session_state["seasonality_df"],
-            key="seasonality_editor",
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            column_config={
-                "Style Name": st.column_config.TextColumn(disabled=True),
-                "Style Number": st.column_config.TextColumn(disabled=True),
-                "Seasonality Tags": st.column_config.TextColumn(
-                    help="Champ libre (ex: spring-summer, fall-winter, core, etc.)",
-                    required=False,
-                ),
-            },
-        )
-
-        # Use the widget live state; normalize to DataFrame
-        current_df = st.session_state.get("seasonality_editor", edited_df)
-        if not isinstance(current_df, pd.DataFrame):
-            try:
-                current_df = pd.DataFrame(current_df)
-            except Exception:
-                current_df = edited_df
         style_season_map = {}
         for _, r in current_df.iterrows():
             k = _clean_style_key(r.get(key_col, ""))
@@ -463,16 +505,18 @@ if supplier_file is not None:
     else:
         st.info("Aucun champ 'Style Name' ou 'Style Number' détecté dans le fichier. Seasonality ignorée.")
 
-# 🔹 Projet pilote : pas de sélection de marque
-brand_choice = ""
+# If no Seasonality table was shown, we still need the single Generate button
+if not seasonality_ui_shown:
+    generate_clicked = st.button(
+        "Générer le fichier Shopify",
+        type="secondary",
+        disabled=not (supplier_file and help_file),
+    )
 
-generate = st.button(
-    "Générer le fichier Shopify",
-    type="secondary",
-    disabled=not (supplier_file and help_file),
-)
-
-if generate:
+# -------------------------
+# Generation
+# -------------------------
+if generate_clicked:
     st.markdown("### Génération en cours")
     status = st.empty()
     progress = st.progress(0)
@@ -482,15 +526,15 @@ if generate:
 
         status.info("Préparation des fichiers…")
         progress.progress(10)
-        time.sleep(0.15)
+        time.sleep(0.10)
 
         status.info("Lecture du fichier fournisseur…")
         progress.progress(25)
-        time.sleep(0.15)
+        time.sleep(0.10)
 
         status.info("Lecture du help data…")
         progress.progress(40)
-        time.sleep(0.15)
+        time.sleep(0.10)
 
         with st.spinner("Traitement en cours…"):
             output_bytes, warnings_df = transform_fn(
@@ -500,13 +544,13 @@ if generate:
                 existing_shopify_xlsx_bytes=(existing_shopify_file.getvalue() if existing_shopify_file is not None else None),
                 vendor_name=supplier_name,
                 brand_choice=brand_choice,  # toujours vide pour le pilote
-                            event_promo_tag=event_promo_tag,
+                event_promo_tag=event_promo_tag,
                 style_season_map=style_season_map,
             )
 
         status.info("Finalisation du fichier Shopify…")
         progress.progress(85)
-        time.sleep(0.15)
+        time.sleep(0.10)
 
         progress.progress(100)
         status.success("Fichier généré avec succès ✅")
