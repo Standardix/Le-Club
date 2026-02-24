@@ -497,6 +497,28 @@ def _remove_size_from_handle(handle: str) -> str:
     return h
 
 
+
+
+def _remove_color_from_handle(handle: str, color_in: str) -> str:
+    """Remove trailing color slug from handle (theme.siblings must NEVER include color)."""
+    if not handle:
+        return ""
+    h = str(handle).strip()
+    c = _strip_reg_for_handle(color_in or "")
+    c = _norm(c)
+    if not c:
+        return h
+    # Match slug construction used in _make_handle (remove apostrophes, dots)
+    raw_c = c.replace("’", "").replace("'", "").replace(".", "")
+    color_slug = slugify(raw_c)
+    if not color_slug:
+        return h
+    suffix = "-" + color_slug
+    if h.lower().endswith(suffix.lower()):
+        return h[: -len(suffix)]
+    return h
+
+
 def _strip_gender_prefix_size(v: str) -> str:
     s = _norm(v)
     if not s:
@@ -1155,6 +1177,12 @@ def _best_match_product_type(text: str, product_types: list[str]) -> str:
         best = ""
         best_len = 0
         for pt in product_types:
+            # Special-case: avoid false positives for "Shoe Covers" when text contains
+            # words like "shoes" and "cover" far apart (e.g., "helping cover expenses").
+            # Only match Shoe Covers when the phrase "shoe cover(s)" is explicitly present.
+            if isinstance(pt, str) and pt.strip().lower() in {"shoe covers", "shoe cover"}:
+                if not re.search(r"\bshoe\s+covers?\b", str(t), flags=re.IGNORECASE):
+                    continue
             pset = _wordset_loose(pt)
             if pset and pset.issubset(tset):
                 if len(pset) > best_len:
@@ -1510,6 +1538,10 @@ def run_transform(
 
     sup = _read_supplier_multi_sheet(supplier_xlsx_bytes, supplier_filename).copy()
 
+    # --- Drop completely empty rows (robust for CSVs where blanks are read as empty strings) ---
+    sup = sup.replace(r"^\s*$", np.nan, regex=True).dropna(how="all")
+
+
     # Satisfy: remove Totals line (often contains zeros that should not become products)
     if vendor_key in ("satisfy",):
         name_col_tmp = _first_existing_col(sup, ["name", "Name"])
@@ -1654,7 +1686,7 @@ def run_transform(
     upc_col = _first_existing_col(sup, ["UPC", "UPC Code", "UPC Code.", "UPC Code 1", "UPC Code1", "UPC1", "Variant Barcode", "Barcode", "bar code", "upc", "upc code"])
     ean_col = _first_existing_col(sup, ["EAN", "EAN Code", "ean", "ean code"])
     origin_col = _first_existing_col(sup, ["Country of origin", "Country of Origin", "Country Of Origin", "Country Code", "Origin", "Manufacturing Country", "COO", "country of origin", "country of origin ", "country code", "origin", "manufacturing country", "coo"])
-    hs_col = _first_existing_col(sup, ["HS Code", "HTS Code", "hs code", "hts code", "commodity hs", "commodity hts", "Commodity HS", "Commodity HTS", "custome tarif code (no dots)", "custom tarif code (no dots)", "custom tarif code", "Custom tarif code (no dots)", "Custom tarif code", "custom tariff code (no dots)", "custom tariff code", "tariff code"])
+    hs_col = _first_existing_col(sup, ["HS Code", "HTS Code", "hs code", "hts code", "commodity hs", "commodity hts", "Commodity HS", "Commodity HTS", "custome tarif code (no dots)", "custom tarif code (no dots)", "custom tarif code", "Custom tarif code (no dots)", "Custom tarif code", "custom tariff code (no dots)", "custom tariff code", "tariff code", "Harmonisation Code", "Harmonization Code"])
     extid_col = _first_existing_col(sup, ["External ID", "ExternalID"])
     msrp_col = _first_existing_col(sup, ["Cad MSRP", "MSRP", "Retail Price (CAD)", "retail price (CAD)", "retail price (cad)"])
     landed_col = _first_existing_col(sup, ["Landed", "landed", "Wholesale Price", "wholesale price", "Wholesale Price (CAD)", "wholesale price (cad)"])
@@ -1958,31 +1990,72 @@ def run_transform(
         if col.lower() in bt.lower():
             return bt
         return f"{bt} - {col}".strip()
-
-    sup["_title"] = [
-        _append_color_if_needed(bt, ct)
-        for bt, ct in zip(base_title.tolist(), sup["_color_title"].astype(str).tolist())
-    ]
-    # Remove sizes from Title (ex: " - M", "(L)", "size XL")
-    sup["_title"] = sup["_title"].astype(str).map(remove_size)
-    sup["_title"] = sup["_title"].astype(str).str.replace(r"\s{2,}", " ", regex=True).str.strip()
-
-    # Max 200 chars (truncate)
-    sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
-    
-    # De-dupe gender words in Title (ex: "Women's Women's ...")
-    def _dedupe_gender_phrase(txt: str) -> str:
-        t = str(txt or "").strip()
-        if not t:
+    # -----------------------------------------------------
+    # Title building
+    # -----------------------------------------------------
+    # Special supplier rule: NORDA
+    # Norda titles already contain the gender marker (M/W) and we must keep their naming convention:
+    #   <MODEL> - <W/M> - <DESCRIPTOR>
+    # We DO NOT apply the generic "Women's / Men's" conversion and we never append color for norda.
+    if vendor_key in ("norda",):
+        def _norda_gender_code(g: str) -> str:
+            gg = _norm(g).lower().replace("’", "'").strip()
+            if gg in ("women", "womens", "women's", "female", "femme", "femmes"):
+                return "W"
+            if gg in ("men", "mens", "men's", "male", "homme", "hommes"):
+                return "M"
             return ""
-        # collapse duplicates like "Women's Women's", "Women Women", etc.
-        t = re.sub(r"(?i)\b(women\'?s|women)\b\s+\b(women\'?s|women)\b", r"\1", t).strip()
-        t = re.sub(r"(?i)\b(men\'?s|men)\b\s+\b(men\'?s|men)\b", r"\1", t).strip()
-        t = re.sub(r"\s{2,}", " ", t).strip()
-        return t
 
-    sup["_title"] = sup["_title"].astype(str).map(_dedupe_gender_phrase)
+        def _norda_title_row(r) -> str:
+            # Use the cleaned description used for titles (already stripped of gender words/tokens)
+            src = r.get("_desc_title_norm") or r.get("_title_name_raw") or r.get("_desc_raw") or ""
+            src = _strip_gender_tokens(_norm(src))
+            src = re.sub(r"(?i)^(men|women|unisex)(\'s)?\s+", "", src).strip()
 
+            if not src:
+                return ""
+
+            parts = src.split()
+            model = parts[0].strip()
+            rest = " ".join(parts[1:]).strip()
+
+            code = _norda_gender_code(r.get("_gender_std", ""))
+
+            if rest:
+                rest_disp = _title_case_preserve_registered(rest)
+                if code:
+                    return f"{model} - {code} - {rest_disp}".strip()
+                return f"{model} - {rest_disp}".strip()
+
+            # If no descriptor, keep model (and code if present)
+            return f"{model} - {code}".strip(" -") if code else model
+
+        sup["_title"] = sup.apply(_norda_title_row, axis=1).astype(str).str.strip()
+        sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
+    else:
+        sup["_title"] = [
+            _append_color_if_needed(bt, ct)
+            for bt, ct in zip(base_title.tolist(), sup["_color_title"].astype(str).tolist())
+        ]
+        # Remove sizes from Title (ex: " - M", "(L)", "size XL")
+        sup["_title"] = sup["_title"].astype(str).map(remove_size)
+        sup["_title"] = sup["_title"].astype(str).str.replace(r"\s{2,}", " ", regex=True).str.strip()
+
+        # Max 200 chars (truncate)
+        sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
+
+        # De-dupe gender words in Title (ex: "Women's Women's ...")
+        def _dedupe_gender_phrase(txt: str) -> str:
+            t = str(txt or "").strip()
+            if not t:
+                return ""
+            # collapse duplicates like "Women's Women's", "Women Women", etc.
+            t = re.sub(r"(?i)\b(women\'?s|women)\b\s+\b(women\'?s|women)\b", r"\1", t).strip()
+            t = re.sub(r"(?i)\b(men\'?s|men)\b\s+\b(men\'?s|men)\b", r"\1", t).strip()
+            t = re.sub(r"\s{2,}", " ", t).strip()
+            return t
+
+        sup["_title"] = sup["_title"].astype(str).map(_dedupe_gender_phrase)
 # Handle: Vendor + Gender + Description + Color (color NON-standardized)
     def _make_handle(r):
         # When description is long and moved to Body (HTML), build handle from Style Name/Name (same rule as Title)
@@ -2038,7 +2111,30 @@ def run_transform(
 
     # Custom Product Type: match using multiple fields (description + title + optional source product type)
     # This ensures keywords like Gilet/Bibs/Long Bibs/Bidon/Baselayer are detected even if not present in DESCRIPTION.
-    sup["_product_type"] = sup["_desc_raw"].apply(lambda t: _best_match_product_type(t, product_types))
+    
+    if vendor_key in ("ciele",):
+        # Ciele toolkits can include many trailing empty rows; ensure we've filtered them.
+        # Headwear file: force Caps/Headwear detection.
+        fn_l = (supplier_filename or "").lower()
+        if "headwear" in fn_l:
+            sup["_product_type"] = "Caps"
+        else:
+            def _ciele_pt(row) -> str:
+                title = str(row.get("Title", "") or "")
+                desc = str(row.get("Description", "") or "")
+                txt = f"{title} {desc}"
+                tset = txt.lower()
+                # Prefer Shorts over Singlet when both words appear in marketing copy.
+                if re.search(r"\bshorts?\b", tset) or "icnshort" in tset:
+                    return "Shorts"
+                # Caps/Headwear keywords
+                if re.search(r"\b(cap|caps|gocap|trucker|bucket|beanie|visor)\b", tset):
+                    return "Caps"
+                # Otherwise fall back to generic matcher.
+                return _best_match_product_type(txt, product_types) or "Apparel"
+            sup["_product_type"] = sup.apply(_ciele_pt, axis=1)
+    else:
+        sup["_product_type"] = sup["_desc_raw"].apply(lambda t: _best_match_product_type(t, product_types))
 
     # Optional: use a source product type column from supplier file if present
     product_type_src_col = _first_existing_col(sup, ["Product Type", "product type", "Type", "Category", "Product category", "Product Category"])
@@ -2146,20 +2242,58 @@ def run_transform(
     # Rebuild Title with corrected gender prefix (and keep all existing rules)
     base_title = (sup["_gender_title"].str.strip() + " " + sup["_desc_title"].str.strip()).str.strip()
 
-    sup["_title"] = [
-        _append_color_if_needed(bt, ct)
-        for bt, ct in zip(base_title.tolist(), sup["_color_title"].astype(str).tolist())
-    ]
-    sup["_title"] = sup["_title"].astype(str).map(remove_size)
-    sup["_title"] = sup["_title"].astype(str).map(_dedupe_gender_phrase)
-    sup["_title"] = sup["_title"].astype(str).str.replace(r"\s{2,}", " ", regex=True).str.strip()
-    sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
+        # Rebuild Title with corrected gender prefix (and keep all existing rules)
+    # Special supplier rule: NORDA
+    if vendor_key in ("norda",):
+        def _norda_gender_code_final(g: str) -> str:
+            gg = _norm(g).lower().replace("’", "'").strip()
+            if gg in ("women", "womens", "women's", "female", "femme", "femmes"):
+                return "W"
+            if gg in ("men", "mens", "men's", "male", "homme", "hommes"):
+                return "M"
+            return ""
+
+        def _norda_title_row_final(r) -> str:
+            src = r.get("_desc_title_norm") or r.get("_title_name_raw") or r.get("_desc_raw") or ""
+            src = _strip_gender_tokens(_norm(src))
+            src = re.sub(r"(?i)^(men|women|unisex)(\'s)?\s+", "", src).strip()
+
+            if not src:
+                return ""
+
+            parts = src.split()
+            model = parts[0].strip()
+            rest = " ".join(parts[1:]).strip()
+
+            code = _norda_gender_code_final(r.get("_gender_final", ""))
+
+            if rest:
+                rest_disp = _title_case_preserve_registered(rest)
+                if code:
+                    return f"{model} - {code} - {rest_disp}".strip()
+                return f"{model} - {rest_disp}".strip()
+
+            return f"{model} - {code}".strip(" -") if code else model
+
+        sup["_title"] = sup.apply(_norda_title_row_final, axis=1).astype(str).str.strip()
+        sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
+    else:
+        base_title = (sup["_gender_title"].str.strip() + " " + sup["_desc_title"].str.strip()).str.strip()
+
+        sup["_title"] = [
+            _append_color_if_needed(bt, ct)
+            for bt, ct in zip(base_title.tolist(), sup["_color_title"].astype(str).tolist())
+        ]
+        sup["_title"] = sup["_title"].astype(str).map(remove_size)
+        sup["_title"] = sup["_title"].astype(str).map(_dedupe_gender_phrase)
+        sup["_title"] = sup["_title"].astype(str).str.replace(r"\s{2,}", " ", regex=True).str.strip()
+        sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
 
     # Rebuild Handle so it uses _gender_final (mens/womens) and de-dupes parts
     sup["_handle"] = sup.apply(_make_handle, axis=1).apply(_remove_size_from_handle)
 
     # Siblings follow handle
-    sup["_siblings"] = sup["_handle"]
+    sup["_siblings"] = sup.apply(lambda r: _remove_color_from_handle(r.get("_handle",""), r.get("_color_in","")), axis=1)
 
 
     # Tags (keep standardized color/gender tags)
@@ -2409,7 +2543,7 @@ def run_transform(
     sup["_google_cat_id"] = sup["_desc_raw"].apply(lambda t: _best_match_id(t, google_cat_rows))
 
     # Siblings
-    sup["_siblings"] = sup["_handle"]
+    sup["_siblings"] = sup.apply(lambda r: _remove_color_from_handle(r.get("_handle",""), r.get("_color_in","")), axis=1)
 
             # SEO Title & SEO Description rules (aligned with Title rules)
     # 1) Vendor + Gender ('s if Men/Women) + Description + " - " + Color (NON-standardized)
@@ -2475,16 +2609,21 @@ def run_transform(
     # ---------------------------------------------------------
     # Composition -> Metafield: my_fields.product_features
     # ---------------------------------------------------------
-    # If a column named 'composition' (any case) exists, map it to product_features.
+    # If a column named 'composition' exists, map it to product_features.
+    # IMPORTANT: Exact-match only (no partial "contains") to avoid matching "Fabric Composition".
+    _norm_cols = {_colkey(c): c for c in sup.columns}
+
     composition_col = None
-    for c in list(sup.columns):
-        if _colkey(c) == "composition":
-            composition_col = c
+    for k in ("composition", "materialcomposition"):
+        if k in _norm_cols:
+            composition_col = _norm_cols[k]
             break
+
     if composition_col is not None:
         sup["_product_features"] = _series_str_clean(sup[composition_col]).map(_sanitize_text_like_html)
     else:
         sup["_product_features"] = ""
+
 
 
     
@@ -2849,14 +2988,14 @@ def run_transform(
 
     buffer = _apply_yellow_for_empty(buffer, "products", yellow_if_empty_cols)
     buffer = _apply_yellow_for_empty(buffer, "do not import", yellow_if_empty_cols)
-    # Red font for Title when it contains "?" or "/" (needs manual review)
+    # Red font for Title when it contains "?" (needs manual review)
     title_warn_cols = ["Title", "SEO Title"]
 
     def _rows_title_warn(df_slice: pd.DataFrame) -> list[int]:
         if "Title" not in df_slice.columns:
             return []
         s = _series_str_clean(df_slice["Title"])
-        mask = s.str.contains(r"[\?/]", regex=True)
+        mask = s.str.contains(r"\?", regex=True)
         return [i for i, v in enumerate(mask.tolist()) if v]
 
     buffer = _apply_red_font_for_rows_cols(buffer, "products", _rows_title_warn(products_df), title_warn_cols)
@@ -2921,8 +3060,8 @@ def run_transform(
 # Header notes (Excel comments) to explain red formatting / validations
     header_notes = {
         "Handle": "ROUGE = Le handle existe déjà dans le fichier d’inventaire fourni.",
-        "Title": "ROUGE = Le titre comporte un des deux caractères suivants: ? ou /.",
-        "SEO Title": "ROUGE = Le titre comporte un des deux caractères suivants: ? ou /.",
+        "Title": "ROUGE = Le titre comporte le caractère suivant: ?.",
+        "SEO Title": "ROUGE = Le titre comporte le caractère suivant: ?.",
         "Tags": "ROUGE = Vérifiez les tags Seasonal et les tags issus du Tag Mapping (col E vide/?/AUCUN/<3).",
         "Metafield: my_fields.colour [single_line_text_field]": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
         "Metafield: mm-google-shopping.color": "ROUGE = Les couleurs ne sont pas présentes dans le mapping (Help Data).",
