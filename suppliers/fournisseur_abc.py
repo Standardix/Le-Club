@@ -120,15 +120,30 @@ def _scrub_nan_token_in_title(s: str) -> str:
 
 
 def _norm_upc(v) -> str:
-    """Normalize UPC/Barcode: keep digits only, drop trailing .0 from numeric."""
+    """Normalize UPC/Barcode for matching:
+    - keep digits only
+    - drop trailing .0 from numeric text
+    - pad to 12 digits when length <= 12 (preserve leading zeros)
+    - keep up to 16 digits for EAN/GTIN
+    """
     if v is None:
         return ""
     s = str(v).strip()
-    # drop .0 for floats represented as '123.0'
     s = re.sub(r"\.0$", "", s)
-    # keep digits only
-    s = re.sub(r"\D", "", s)
-    return s
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return ""
+    # treat all-zero as empty
+    try:
+        if int(digits) == 0:
+            return ""
+    except Exception:
+        pass
+    if len(digits) <= 12:
+        return digits.zfill(12)
+    if len(digits) <= 16:
+        return digits
+    return digits[:16]
 
 
 
@@ -291,11 +306,12 @@ def _build_existing_shopify_index(existing_shopify_xlsx_bytes: bytes | None):
         upc = _norm_upc(r.get(upc_col, "")) if upc_col else ""
 
         # Priority order for keys
+        # Index multiple matching keys so we can match even when SKU is missing in incoming files.
+        if upc:
+            key_sets["upc"].add((upc,))
         if sku and upc:
             key_sets["sku_upc"].add((sku, upc))
-        elif upc:
-            key_sets["upc"].add((upc,))
-        elif vendor and sku:
+        if vendor and sku:
             key_sets["vendor_sku"].add((vendor, sku))
 
     return handles_set, key_sets
@@ -355,6 +371,35 @@ import openpyxl
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
 
+
+
+def _to_dot_decimal_str(x) -> str:
+    """Force decimal separator to dot and return a STRING for Excel/Shopify.
+    - Empty/NaN/None -> '0'
+    - Numbers -> formatted with 2 decimals (keeps 114.99)
+    - Strings with comma -> comma replaced by dot
+    """
+    if x is None:
+        return "0"
+    try:
+        import math
+        if isinstance(x, float) and math.isnan(x):
+            return "0"
+    except Exception:
+        pass
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return "0"
+    # normalize comma to dot
+    s = s.replace(",", ".")
+    # if looks numeric, format to 2 decimals (but keep integers as '0'??)
+    try:
+        v = float(s)
+        if v == 0:
+            return "0"
+        return f"{v:.2f}"
+    except Exception:
+        return s
 
 def _sanitize_nan(df):
     """Replace NaN / None with empty string for Shopify export."""
@@ -1700,19 +1745,31 @@ def run_transform(
     name_hint_col = _first_existing_col(sup, ["Style Name", "Name", "Product Name", "Title", "Style", "Description", "Display Name", "Online Display Name"])
     sku_hint_col = extid_col or product_col
     def _infer_gender_from_texts(name_val: str, sku_val: str) -> str:
-        # Look across name/description-like text + sku for gender signals
+        """Infer gender from supplier text + SKU-like fields.
+
+        Looks for:
+        - explicit SKU markers: -w- / -m- (with or without spaces)
+        - 'Women' / 'Men' words (incl. possessive)
+        - codes like W#### or M#### (prefix letter + digits)
+        """
         t = f"{_norm(name_val)} {_norm(sku_val)}".lower()
 
-        # Strong markers in SKUs like -w- / -m-
-        if re.search(r"-\s*w\s*-", t):
+        # Strong markers in SKUs like -w- / -m- (allow no spaces too)
+        if re.search(r"-\s*w\s*-", t) or re.search(r"-w-", t):
             return "Women"
-        if re.search(r"-\s*m\s*-", t):
+        if re.search(r"-\s*m\s*-", t) or re.search(r"-m-", t):
+            return "Men"
+
+        # Prefix code patterns like W1234 / M1234 (start or after a separator)
+        if re.search(r"(?<![a-z0-9])w(?=\d)", t):
+            return "Women"
+        if re.search(r"(?<![a-z0-9])m(?=\d)", t):
             return "Men"
 
         # Text markers (women/men, women's/men's)
-        if re.search(r"\bwomen\b|\bwomen's\b|\bwomens\b|\bfemale\b", t):
+        if re.search(r"\bwomen\b|\bwomen's\b|\bwomens\b|\bfemale\b|\bfemme\b", t):
             return "Women"
-        if re.search(r"\bmen\b|\bmen's\b|\bmens\b|\bmale\b", t):
+        if re.search(r"\bmen\b|\bmen's\b|\bmens\b|\bmale\b|\bhomme\b", t):
             return "Men"
         return ""
 
@@ -1767,7 +1824,19 @@ def run_transform(
     # Base description (keep both a normalized version and the original source text)
     sup["_desc_source"] = _series_str_clean(sup[desc_col])  # preserve original (length, punctuation, line breaks)
     sup["_desc_raw"] = sup["_desc_source"].map(_norm)
+
+    # Normalized description used for Title/SEO (kept separate from _desc_raw for safe later transforms)
+    sup["_desc_title_norm"] = sup["_desc_raw"].copy()
+
     sup["_desc_seo"] = sup["_desc_raw"].apply(_convert_r_to_registered)
+
+    # -----------------------------------------------------
+    # Long description helper fields must be defined BEFORE _desc_handle is computed
+    # -----------------------------------------------------
+    title_name_col = _first_existing_col(sup, ["Style Name", "Name", "Product Name", "Title", "Style"])
+    sup["_title_name_raw"] = _series_str_clean(sup[title_name_col]).map(_norm) if title_name_col else ""
+    sup["_desc_is_long"] = sup["_desc_source"].apply(lambda x: len(str(x)) > 200)
+
     sup["_desc_handle"] = sup.apply(lambda r: _strip_reg_for_handle(r["_title_name_raw"]) if r.get("_desc_is_long") and r.get("_title_name_raw") else _strip_reg_for_handle(r["_desc_raw"]), axis=1)
 
     # -----------------------------------------------------
@@ -1775,10 +1844,6 @@ def run_transform(
     # If the SOURCE description text is > 200 chars, move it to Body (HTML)
     # and build Title from Style Name / Name instead of the long description.
     # -----------------------------------------------------
-    title_name_col = _first_existing_col(sup, ["Style Name", "Name", "Product Name", "Title", "Style"])
-    sup["_title_name_raw"] = _series_str_clean(sup[title_name_col]).map(_norm) if title_name_col else ""
-
-    sup["_desc_is_long"] = sup["_desc_source"].apply(lambda x: len(str(x)) > 200)
 
     # Put the original description in Body (HTML) when long (not the normalized one)
     sup["_body_html"] = sup.apply(lambda r: str(r["_desc_source"]).strip() if r["_desc_is_long"] else "", axis=1)
@@ -1883,81 +1948,14 @@ def run_transform(
     # -----------------------------------------------------
     
     def _gender_for_title(g: str) -> str:
-        """Title prefix rule:
-        - Men -> Men's
-        - Women -> Women's
-        - Non genré / Unisex / empty -> no prefix
+        """Return the gender prefix for display fields (Title / SEO Title).
+        Business rule: ONLY Women is allowed. Men/Unisex must NEVER be written.
         """
-        gg = _norm(g)
-        if not gg:
-            return ""
-        ggl = gg.lower().replace("’", "'").strip()
-
-        # Women
-        if ggl in ("women", "womens", "women's", "female", "femme", "femmes"):
-            return "Women's"
-
-        # Men
-        if ggl in ("men", "mens", "men's", "male", "homme", "hommes"):
-            return "Men's"
-
-        return ""
-        ggl = gg.lower().replace("’", "'")
-        # Accept common normalized forms (incl. already possessive)
-        if ggl in ("women", "womens", "women's", "female", "femme", "femmes"):
+        gg = str(g or "").strip().lower().replace("’", "'")
+        if gg in ("women", "woman", "womens", "women's", "female", "ladies", "femme", "femmes"):
             return "Women's"
         return ""
 
-    # Column to use as the primary "name/description" source for Title.
-    # IMPORTANT: even when a column is selected, we still do row-level fallbacks
-    # (ex: MAAP has a Description column but many rows are empty -> fallback to Name per row).
-    title_desc_col = _first_existing_col_with_data(
-        sup,
-        [
-            "Description",
-            "Product Name",
-            "Title",
-            "Style",
-            "Style Name",
-            "Display Name",
-            "Online Display Name",
-            "Name",
-            "name",
-        ],
-    )
-
-    # Safeguard: if selected title column yields all-empty, fallback to Name/name.
-    if title_desc_col is not None:
-        _tmp = _series_str_clean(sup[title_desc_col]).str.strip()
-        if (_tmp.eq("").all()) and ("Name" in sup.columns or "name" in sup.columns):
-            title_desc_col = _first_existing_col_with_data(sup, ["Name", "name"])
-
-    # SATISFY: prefer supplier Name/name column for Title (same naming basis as handle/SEO title).
-    if vendor_key in ("satisfy",):
-        _s_name = _first_existing_col(sup, ["Name", "name"])
-        if _s_name:
-            title_desc_col = _s_name
-
-    # Build description text used for Title (normalized, row-wise fallbacks).
-    if title_desc_col is not None:
-        _desc_series = _series_str_clean(sup[title_desc_col]).map(_norm)
-    else:
-        _desc_series = _series_str_clean(sup["_desc_seo"]).map(_norm)
-
-    _name_series = _series_str_clean(sup.get("_title_name_raw", "")).map(_norm)
-
-    # Row-level fallback:
-    # - If original supplier description is long (>200 chars) we use Style Name/Name (already in _title_name_raw).
-    # - Else if the selected description cell is empty, fallback to Style Name/Name.
-    _desc_series = _desc_series.where(_desc_series.astype(str).str.strip().ne(""), _name_series)
-    if "_desc_is_long" in sup.columns:
-        mask_long = sup["_desc_is_long"] & _name_series.astype(str).str.strip().ne("")
-        _desc_series = _desc_series.where(~mask_long, _name_series)
-
-    sup["_desc_title_norm"] = _desc_series.apply(_convert_r_to_registered)
-# Clean description text used for Title/SEO fields:
-    # - remove embedded gender markers like -w- / -m-
-    # - remove leading Men/Women tokens to avoid duplicates with Gender prefix
     def _clean_desc_for_display(s: str) -> str:
         t = _norm(s)
         if not t:
@@ -1968,7 +1966,6 @@ def run_transform(
         return t
 
     sup["_desc_title_norm"] = _series_str_clean(sup["_desc_title_norm"]).map(_clean_desc_for_display)
-    sup["_title_name_raw"] = _series_str_clean(sup["_title_name_raw"]).map(_clean_desc_for_display)
 
     sup["_gender_title"] = _series_str_clean(sup["_gender_std"]).map(_gender_for_title)
     sup["_desc_title"] = _series_str_clean(sup["_desc_title_norm"]).map(_title_case_preserve_registered)
@@ -2008,7 +2005,7 @@ def run_transform(
 
         def _norda_title_row(r) -> str:
             # Use the cleaned description used for titles (already stripped of gender words/tokens)
-            src = r.get("_desc_title_norm") or r.get("_title_name_raw") or r.get("_desc_raw") or ""
+            src = r.get("_title_name_raw") or r.get("_desc_title_norm") or r.get("_desc_raw") or ""
             src = _strip_gender_tokens(_norm(src))
             src = re.sub(r"(?i)^(men|women|unisex)(\'s)?\s+", "", src).strip()
 
@@ -2067,16 +2064,10 @@ def run_transform(
 
         # Normalize gender for handle: mens / womens, blank for non-gendered
         def _gender_for_handle(g: str) -> str:
-            gg = _norm(g)
-            if not gg:
-                return ""
-            ggl = gg.lower().replace("’", "'").strip()
-            if ggl in ("non genré", "non-genré", "nongendre", "unisex", "uni sex"):
-                return ""
-            if ggl in ("women", "womens", "women's", "female", "femme", "femmes"):
+            """Return gender slug for Handle. ONLY womens is allowed; never mens/unisex."""
+            gg = _norm(g).lower().replace("’", "'").strip()
+            if gg in ("women", "womens", "women's", "female", "ladies", "femme", "femmes"):
                 return "womens"
-            if ggl in ("men", "mens", "men's", "male", "homme", "hommes"):
-                return "mens"
             return ""
 
         gender_handle = _gender_for_handle(r.get("_gender_final", ""))
@@ -2254,7 +2245,7 @@ def run_transform(
             return ""
 
         def _norda_title_row_final(r) -> str:
-            src = r.get("_desc_title_norm") or r.get("_title_name_raw") or r.get("_desc_raw") or ""
+            src = r.get("_title_name_raw") or r.get("_desc_title_norm") or r.get("_desc_raw") or ""
             src = _strip_gender_tokens(_norm(src))
             src = re.sub(r"(?i)^(men|women|unisex)(\'s)?\s+", "", src).strip()
 
@@ -2723,8 +2714,7 @@ def run_transform(
     out["Variant Inventory Tracker"] = "shopify"
     out["Variant Inventory Policy"] = "deny"
     out["Variant Fulfillment Service"] = "manual"
-    out["Variant Price"] = sup["_price"]
-
+    out["Variant Price"] = sup["_price"].apply(_to_dot_decimal_str)
     out["Variant Requires Shipping"] = True
     out["Variant Taxable"] = True
 
@@ -2736,7 +2726,7 @@ def run_transform(
     out["Metafield: my_fields.product_features [multi_line_text_field]"] = out["Metafield: my_fields.product_features [multi_line_text_field]"].map(_sanitize_text_like_html)
 
     out["Variant Weight Unit"] = "g"
-    out["Cost per item"] = sup["_cost"]
+    out["Cost per item"] = sup["_cost"].apply(_to_dot_decimal_str)
     out["Status"] = "draft"
 
     out["Metafield: my_fields.product_use_case [multi_line_text_field]"] = ""
@@ -2923,18 +2913,18 @@ def run_transform(
 
         def _getcol(r, c):
             return r.get(c, "") if c else ""
-        handle_col_out = "Handle" if "Handle" in out.columns else None
-
+                # NOTE: Handle is NOT used to determine "do not import".
+        # Matching is STRICTLY based on keys:
+        #   1) SKU + UPC  -> SKU|UPC
+        #   2) UPC only   -> UPC
+        #   3) Vendor+SKU -> Vendor|SKU
+        #   4) If none available -> NEVER sent to "do not import"
         mask_existing = []
         for _, r in out.iterrows():
             vendor = _getcol(r, vendor_col) or vendor_name
             sku = _getcol(r, sku_col)
             upc = _getcol(r, upc_col)
-            handle_val = _getcol(r, handle_col_out)
-            handle_norm = _norm_handle(handle_val) if handle_col_out else ""
-            is_existing = (handle_norm in existing_handles_set) if handle_norm else False
-            if not is_existing:
-                is_existing = _row_is_existing(str(vendor), str(sku), str(upc), existing_key_sets)
+            is_existing = _row_is_existing(str(vendor), str(sku), str(upc), existing_key_sets)
             mask_existing.append(is_existing)
 
         mask_existing = pd.Series(mask_existing, index=out.index)
