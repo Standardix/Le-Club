@@ -43,7 +43,7 @@ def map_custom_product_type(val: str) -> str:
     return val
 
 
-SIZE_REGEX = re.compile(r"""(\s*[-/]?\s*(?:size\s*)?\b(?:xxs|xs|s|m|l|xl|xxl|xxxl)\b)""", re.IGNORECASE)
+SIZE_REGEX = re.compile(r"""(\s*[-/]?\s*(?:size\s*)?\b(?:xxs|xs|s|m|l|xl|xxl|xxxl|os)\b)""", re.IGNORECASE)
 
 def _looks_like_size(v: str) -> bool:
     if v is None:
@@ -79,6 +79,21 @@ def remove_size(text):
     return t.strip()
 
 
+def _strip_trailing_dashes(text: str) -> str:
+    """Remove any trailing dash separators left after size removal (e.g., 'Off White -')."""
+    if text is None:
+        return ""
+    t = str(text)
+    # remove one or more trailing hyphen-like separators with surrounding spaces
+    t = re.sub(r"(?:\s*[-–—]\s*)+$", "", t)
+    # also remove trailing slashes just in case
+    t = re.sub(r"(?:\s*/\s*)+$", "", t)
+    # normalize spaces
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
+
+
 
 
 def _strip_size_tokens(s: str) -> str:
@@ -91,10 +106,10 @@ def _strip_size_tokens(s: str) -> str:
     out = s
 
     # Remove parenthesized sizes, e.g. "(M)" or "(size M)"
-    out = re.sub(r"(?i)\(\s*(?:size\s*)?(?:xxs|xs|s|m|l|xl|xxl|xxxl)\s*\)", "", out)
+    out = re.sub(r"(?i)\(\s*(?:size\s*)?(?:xxs|xs|s|m|l|xl|xxl|xxxl|os)\s*\)", "", out)
 
     # Remove size tokens only when preceded by a separator or whitespace (so we don't touch words like "Studios")
-    out = re.sub(r"(?i)(?:\s*[-/]\s*|\s+)(?:size\s*)?(?:xxs|xs|s|m|l|xl|xxl|xxxl)\b", "", out)
+    out = re.sub(r"(?i)(?:\s*[-/]\s*|\s+)(?:size\s*)?(?:xxs|xs|s|m|l|xl|xxl|xxxl|os)\b", "", out)
 
     # Cleanup leftover separators/spaces
     out = re.sub(r"\s{2,}", " ", out).strip()
@@ -2036,6 +2051,7 @@ def run_transform(
         ]
         # Remove sizes from Title (ex: " - M", "(L)", "size XL")
         sup["_title"] = sup["_title"].astype(str).map(remove_size)
+        sup["_title"] = sup["_title"].astype(str).map(_strip_trailing_dashes)
         sup["_title"] = sup["_title"].astype(str).str.replace(r"\s{2,}", " ", regex=True).str.strip()
 
         # Max 200 chars (truncate)
@@ -2276,6 +2292,7 @@ def run_transform(
             for bt, ct in zip(base_title.tolist(), sup["_color_title"].astype(str).tolist())
         ]
         sup["_title"] = sup["_title"].astype(str).map(remove_size)
+        sup["_title"] = sup["_title"].astype(str).map(_strip_trailing_dashes)
         sup["_title"] = sup["_title"].astype(str).map(_dedupe_gender_phrase)
         sup["_title"] = sup["_title"].astype(str).str.replace(r"\s{2,}", " ", regex=True).str.strip()
         sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
@@ -2529,9 +2546,41 @@ def run_transform(
 
     sup["_size_comment"] = sup.apply(_size_comment, axis=1)
 
-    # Categories: match using DESCRIPTION (to catch LONG SLEEVE, TEE → tshirt)
-    sup["_shopify_cat_id"] = sup["_desc_raw"].apply(lambda t: _best_match_id(t, shopify_cat_rows))
-    sup["_google_cat_id"] = sup["_desc_raw"].apply(lambda t: _best_match_id(t, google_cat_rows))
+    # ---------------------------------------------------------
+    # Categories resolution (v31.2 improved logic)
+    # ---------------------------------------------------------
+    # PRIORITY:
+    # 1️⃣ Custom Product Type (sup["_product_type"])
+    # 2️⃣ Description (sup["_desc_raw"])
+    # 3️⃣ Title (sup["_title"])
+    # ---------------------------------------------------------
+    
+    def _resolve_category_id(row, cat_rows):
+        # 1️⃣ PRIORITY: Custom Product Type
+        pt = row.get("_product_type", "") or ""
+        if pt:
+            cid = _best_match_id(pt, cat_rows)
+            if cid:
+                return cid
+    
+        # 2️⃣ Fallback: Description
+        desc = row.get("_desc_raw", "") or ""
+        if desc:
+            cid = _best_match_id(desc, cat_rows)
+            if cid:
+                return cid
+    
+        # 3️⃣ Fallback: Title
+        title = row.get("_title", "") or ""
+        if title:
+            cid = _best_match_id(title, cat_rows)
+            if cid:
+                return cid
+    
+        return ""
+    
+    sup["_shopify_cat_id"] = sup.apply(lambda r: _resolve_category_id(r, shopify_cat_rows), axis=1)
+    sup["_google_cat_id"]  = sup.apply(lambda r: _resolve_category_id(r, google_cat_rows), axis=1)
 
     # Siblings
     sup["_siblings"] = sup.apply(lambda r: _remove_color_from_handle(r.get("_handle",""), r.get("_color_in","")), axis=1)
@@ -2544,7 +2593,7 @@ def run_transform(
         # SEO Title: aligned with Title rules
     # Vendor + Gender ('s if Men/Women) + Description/Style Name + " - " + Color (NON-standardized)
     def _seo_base(r) -> str:
-        vendor = _title_case_preserve_registered(_norm(r.get("_vendor", "")))
+        vendor = str(r.get("_vendor", "") or "")
 
         # Gender prefix: Men's / Women's (blank if NON genré)
         g = _gender_for_title(_norm(r.get("_gender_final", "")))
@@ -2576,8 +2625,8 @@ def run_transform(
     # Prefix fixe + contenu marque (help data -> SEO Description Brand Part), sinon fallback générique
     def _seo_desc(r):
         prefix = f"Shop the {r['_seo_title']} with free worldwide shipping, and 30-day returns on leclub.cc. "
-        brand_name = _norm(r.get("_brand_choice") or r.get("_vendor"))
-        brand_disp = _title_case_preserve_registered(brand_name)
+        brand_name = str(r.get("_vendor", "") or "")
+        brand_disp = brand_name
 
         bkey = brand_name.strip().lower()
         if bkey and bkey in brand_desc_map:
