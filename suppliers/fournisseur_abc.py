@@ -264,6 +264,101 @@ def _series_str_clean(s: pd.Series) -> pd.Series:
     s2 = s.fillna("").astype(str).replace({r"^\s*(nan|none)\s*$": ""}, regex=True)
     return s2
 
+
+def _read_le_braquet_xlsx(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Read Le Braquet order workbook using ONLY the "Le Club" sheet.
+
+    Business rules:
+    - Ignore all other sheets.
+    - Expand merged-cell values so product-level rows inherit shared values
+      (section/gender, description, category, prices, colour, totals, etc.).
+    - Rebuild clear column names even when the workbook is a visual order form
+      rather than a tabular supplier export.
+
+    Expected layout in the uploaded workbook:
+    - Row 11/12 contain the visible headers
+    - Data starts at row 15
+    - Column H (SKU / code produit boutique) identifies item rows
+    """
+    # data_only=True to read the computed value of "Coûtant" instead of Excel formulas
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    if "Le Club" not in wb.sheetnames:
+        raise ValueError('Onglet "Le Club" introuvable dans le fichier Le Braquet.')
+    ws = wb["Le Club"]
+
+    # Build merged-value lookup from top-left cell of each merged range
+    merged_lookup = {}
+    for mr in ws.merged_cells.ranges:
+        top_left = ws.cell(mr.min_row, mr.min_col).value
+        for rr in range(mr.min_row, mr.max_row + 1):
+            for cc in range(mr.min_col, mr.max_col + 1):
+                merged_lookup[(rr, cc)] = top_left
+
+    def _cell_value(r: int, c: int):
+        v = ws.cell(r, c).value
+        if v is None and (r, c) in merged_lookup:
+            v = merged_lookup[(r, c)]
+        return v
+
+    # Explicit supplier column mapping based on the Le Braquet layout
+    col_names = [
+        "Unused A",          # A
+        "Gender",            # B
+        "Description",       # C
+        "Product Type",      # D (Coupe | Catégorie)
+        "Wholesale CAD",     # E (Coûtant)
+        "Retail CAD",        # F (PDSF)
+        "Color",             # G
+        "SKU",               # H
+        "GTIN",              # I
+        "Size",              # J
+        "Quantity",          # K
+        "Cost Total",        # L
+        "Total Quantity",    # M
+        "N", "O", "P", "Q", "R", "S", "T", "U",
+    ]
+
+    records = []
+    for r in range(15, ws.max_row + 1):
+        sku = _cell_value(r, 8)
+        if sku is None or str(sku).strip() == "":
+            continue
+
+        row = {col_names[c - 1]: _cell_value(r, c) for c in range(1, min(ws.max_column, len(col_names)) + 1)}
+        records.append(row)
+
+    if not records:
+        raise ValueError('Aucune ligne produit détectée dans l’onglet "Le Club" du fichier Le Braquet.')
+
+    df = pd.DataFrame(records)
+
+    for c in df.columns:
+        df[c] = df[c].apply(lambda x: "" if x is None else x)
+
+    # Supplier-specific cleanup for visible text coming from the order form
+    for c in ["Gender", "Description", "Product Type", "Color", "SKU", "GTIN", "Size"]:
+        if c in df.columns:
+            if c == "Color":
+                df[c] = df[c].apply(_clean_color_label)
+            else:
+                df[c] = df[c].apply(_clean_supplier_display_text)
+
+    df = df.loc[df["SKU"].astype(str).str.strip().ne("")].copy()
+
+    # Keep only rows where an order quantity was actually entered.
+    # For Le Braquet, blank or zero quantities must not be exported.
+    qty_raw = _series_str_clean(df["Quantity"]).str.strip()
+    qty_num = pd.to_numeric(
+        qty_raw.str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    df = df.loc[qty_num.fillna(0) > 0].copy()
+
+    df["_source_sheet"] = "Le Club"
+    return df
+
+
 import numpy as np
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
@@ -522,6 +617,43 @@ def _sanitize_text_like_html(v) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
+
+def _remove_triple_asterisks(v) -> str:
+    """Remove decorative *** markers while preserving the surrounding text."""
+    if v is None:
+        return ""
+    s = str(v)
+    s = re.sub(r"\*{3,}", " ", s)
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+def _clean_color_label(v) -> str:
+    """Clean supplier colour labels.
+
+    Rules:
+    - remove decorative *** markers
+    - remove 'Nouveauté' prefixes such as:
+      'NOUVEAUTÉ Bleu lavande', 'Nouveauté Couleur 1', etc.
+    - keep the actual colour name/value
+    """
+    s = _remove_triple_asterisks(v)
+    if not s:
+        return ""
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    # remove leading novelty markers only, keep the actual colour name/value
+    s = re.sub(r"(?i)^nouveaut[ée]\s*[-:/]?\s*", "", s).strip()
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+def _clean_supplier_display_text(v) -> str:
+    """General cleanup for supplier text fields shown in output."""
+    s = _remove_triple_asterisks(v)
+    if not s:
+        return ""
+    s = s.replace("\r", " ")
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
 def _strip_made_in(s: str) -> str:
     t = _norm(s)
     # remove common prefixes like "Made In "
@@ -549,7 +681,7 @@ def _remove_size_from_handle(handle: str) -> str:
     h = str(handle).strip().lower()
 
     # Tailles alpha à la fin
-    h = re.sub(r"-(xs|s|m|l|xl|xxl|xxxl|os)$", "", h)
+    h = re.sub(r"-(xxs|xs|s|m|l|xl|xxl|xxxl|os)$", "", h)
 
     # Tailles numériques à la fin (6, 6.5, 10-5, etc.)
     h = re.sub(r"-\d+([.-]\d+)?$", "", h)
@@ -782,6 +914,12 @@ def _read_2col_map(wb, sheet_candidates: list[str]) -> dict[str, str]:
         if not ra or ra.lower() == "nan":
             continue
         m[ra.lower()] = rb
+        # basic singular/plural fallbacks for French/English gender labels
+        lk = ra.lower()
+        if lk.endswith('s'):
+            m.setdefault(lk[:-1], rb)
+        else:
+            m.setdefault(lk + 's', rb)
     return m
 
 
@@ -1487,6 +1625,11 @@ def run_transform(
           (Description-like), then concatenate.
         - If there is a single valid sheet, behaves like the previous implementation.
         """
+        # Supplier-specific override: Le Braquet uses a visual order form.
+        # We must read ONLY the "Le Club" sheet, rebuild headers, and propagate merged values.
+        if _colkey(vendor_name) in ("lebraquet",):
+            return _read_le_braquet_xlsx(file_bytes)
+
         # CSV support (v15): allow suppliers to provide a single CSV instead of XLSX
         if str(file_name or "").strip().lower().endswith(".csv"):
             try:
@@ -1759,15 +1902,47 @@ def run_transform(
     # -----------------------------------------------------
     name_hint_col = _first_existing_col(sup, ["Style Name", "Name", "Product Name", "Title", "Style", "Description", "Display Name", "Online Display Name"])
     sku_hint_col = extid_col or product_col
-    def _infer_gender_from_texts(name_val: str, sku_val: str) -> str:
+    sku_gender_cols = []
+    for _c in [
+        product_col,
+        extid_col,
+        _first_existing_col(sup, ["SKU", "sku"]),
+        _first_existing_col(sup, ["SKU 1", "sku 1"]),
+        _first_existing_col(sup, ["SKU1", "sku1"]),
+    ]:
+        if _c and _c not in sku_gender_cols:
+            sku_gender_cols.append(_c)
+
+    def _infer_gender_from_texts(name_val: str, sku_val: str, sku_values: list[str] | None = None) -> str:
         """Infer gender from supplier text + SKU-like fields.
 
         Looks for:
+        - if ALL non-empty SKU-like columns start with M => Men
+        - if ALL non-empty SKU-like columns start with W => Women
         - explicit SKU markers: -w- / -m- (with or without spaces)
         - 'Women' / 'Men' words (incl. possessive)
         - codes like W#### or M#### (prefix letter + digits)
         """
-        t = f"{_norm(name_val)} {_norm(sku_val)}".lower()
+        sku_values = sku_values or []
+
+        # New rule requested by user:
+        # only infer from SKU prefix when every non-empty SKU-like column agrees.
+        sku_prefixes = []
+        for raw in sku_values:
+            s = _norm(raw).strip()
+            if not s:
+                continue
+            m = re.match(r"(?i)^([mw])(?=[a-z0-9])", s)
+            if m:
+                sku_prefixes.append(m.group(1).upper())
+            else:
+                sku_prefixes.append("OTHER")
+        if sku_prefixes and all(p == "M" for p in sku_prefixes):
+            return "Men"
+        if sku_prefixes and all(p == "W" for p in sku_prefixes):
+            return "Women"
+
+        t = f"{_norm(name_val)} {_norm(sku_val)} {' '.join(_norm(v) for v in sku_values)}".lower()
 
         # Strong markers in SKUs like -w- / -m- (allow no spaces too)
         if re.search(r"-\s*w\s*-", t) or re.search(r"-w-", t):
@@ -1782,9 +1957,9 @@ def run_transform(
             return "Men"
 
         # Text markers (women/men, women's/men's)
-        if re.search(r"\bwomen\b|\bwomen's\b|\bwomens\b|\bfemale\b|\bfemme\b", t):
+        if re.search(r"\bwomen\b|\bwomen's\b|\bwomens\b|\bfemale\b|\bfemme\b|\bfemmes\b", t):
             return "Women"
-        if re.search(r"\bmen\b|\bmen's\b|\bmens\b|\bmale\b|\bhomme\b", t):
+        if re.search(r"\bmen\b|\bmen's\b|\bmens\b|\bmale\b|\bhomme\b|\bhommes\b", t):
             return "Men"
         return ""
 
@@ -1864,8 +2039,14 @@ def run_transform(
     sup["_body_html"] = sup.apply(lambda r: str(r["_desc_source"]).strip() if r["_desc_is_long"] else "", axis=1)
     # Clean HTML-ish artifacts in Body (HTML)
     sup["_body_html"] = sup["_body_html"].map(_sanitize_text_like_html)
+    sup["_body_html"] = sup["_body_html"].map(_clean_supplier_display_text)
+    sup["_desc_source"] = sup["_desc_source"].map(_clean_supplier_display_text)
+    sup["_desc_raw"] = sup["_desc_source"].map(_norm)
+    sup["_desc_title_norm"] = sup["_desc_raw"].copy()
+    if title_name_col:
+        sup["_title_name_raw"] = _series_str_clean(sup[title_name_col]).map(_clean_supplier_display_text).map(_norm)
     # Color / Size input
-    sup["_color_raw"] = _series_str_clean(sup[color_col]).map(_norm) if color_col else ""
+    sup["_color_raw"] = _series_str_clean(sup[color_col]).map(_clean_color_label).map(_norm) if color_col else ""
     sup["_size_raw"] = _series_str_clean(sup[size_col]).map(_norm) if size_col else ""
 
     # Fallback parse from description if missing
@@ -1879,7 +2060,9 @@ def run_transform(
     if vendor_key in ("pasnormalstudios", "pasnormalstudio"):
         sup.loc[sup["_color_in"].str.upper().isin(["OS", "ONE SIZE"]), "_color_in"] = ""
 
+    sup["_color_fb"] = sup["_color_fb"].map(_clean_color_label)
     sup.loc[sup["_color_in"].eq(""), "_color_in"] = sup["_color_fb"]
+    sup["_color_in"] = sup["_color_in"].map(_clean_color_label)
     # If "color" value is actually a size, clear it and fallback again
     sup.loc[sup["_color_in"].apply(_looks_like_size), "_color_in"] = ""
     sup.loc[sup["_color_in"].eq(""), "_color_in"] = sup["_color_fb"]
@@ -1937,6 +2120,7 @@ def run_transform(
         lambda r: _infer_gender_from_texts(
             r.get(name_hint_col, "") if name_hint_col else "",
             r.get(sku_hint_col, "") if sku_hint_col else "",
+            [r.get(c, "") for c in sku_gender_cols],
         ),
         axis=1,
     )
@@ -1984,7 +2168,7 @@ def run_transform(
 
     sup["_gender_title"] = _series_str_clean(sup["_gender_std"]).map(_gender_for_title)
     sup["_desc_title"] = _series_str_clean(sup["_desc_title_norm"]).map(_title_case_preserve_registered)
-    sup["_color_title"] = _series_str_clean(sup["_color_in"]).map(_title_case_preserve_registered)
+    sup["_color_title"] = _series_str_clean(sup["_color_in"]).map(_clean_color_label).map(_title_case_preserve_registered)
 
     # Avoid duplicating colour in Title if it is already present in the description text
     _desc_l = sup["_desc_title_norm"].astype(str).str.lower()
@@ -2043,6 +2227,7 @@ def run_transform(
             return f"{model} - {code}".strip(" -") if code else model
 
         sup["_title"] = sup.apply(_norda_title_row, axis=1).astype(str).str.strip()
+        sup["_title"] = sup["_title"].astype(str).map(_clean_supplier_display_text)
         sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
     else:
         sup["_title"] = [
@@ -2055,6 +2240,7 @@ def run_transform(
         sup["_title"] = sup["_title"].astype(str).str.replace(r"\s{2,}", " ", regex=True).str.strip()
 
         # Max 200 chars (truncate)
+        sup["_title"] = sup["_title"].astype(str).map(_clean_supplier_display_text)
         sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
 
         # De-dupe gender words in Title (ex: "Women's Women's ...")
@@ -2175,6 +2361,27 @@ def run_transform(
     # Final enforcement: always output canonical Product Types from Help Data
     sup["_product_type"] = sup["_product_type"].apply(_canon_product_type)
 
+    # Le Braquet files are French order forms. Add a targeted fallback so
+    # the main apparel families map to Help Data product types before the
+    # gendering logic runs.
+    if vendor_key in ("lebraquet",):
+        _lb_blob = _pt_blob.astype(str).str.lower()
+        sup.loc[
+            sup["_product_type"].astype(str).str.strip().eq("") & _lb_blob.str.contains(r"\bmaillot\b.*\bmanches\s+courtes?\b|\bmanches\s+courtes?\b.*\bmaillot\b", regex=True),
+            "_product_type",
+        ] = _canon_product_type("Jersey")
+        sup.loc[
+            sup["_product_type"].astype(str).str.strip().eq("") & _lb_blob.str.contains(r"\bmaillot\b.*\bmanches\s+longues?\b|\bmanches\s+longues?\b.*\bmaillot\b", regex=True),
+            "_product_type",
+        ] = _canon_product_type("Long Sleeve Jersey")
+        sup.loc[
+            sup["_product_type"].astype(str).str.strip().eq("") & _lb_blob.str.contains(r"\bcuissard\b.*\bbretelles\b|\bbretelles\b.*\bcuissard\b", regex=True),
+            "_product_type",
+        ] = _canon_product_type("Bib Shorts")
+        sup.loc[
+            sup["_product_type"].astype(str).str.strip().eq("") & _lb_blob.str.contains(r"\bchaussettes?\b|\bsocquettes?\b", regex=True),
+            "_product_type",
+        ] = _canon_product_type("Socks")
 
 
     # -----------------------------------------------------
@@ -2283,6 +2490,7 @@ def run_transform(
             return f"{model} - {code}".strip(" -") if code else model
 
         sup["_title"] = sup.apply(_norda_title_row_final, axis=1).astype(str).str.strip()
+        sup["_title"] = sup["_title"].astype(str).map(_clean_supplier_display_text)
         sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
     else:
         base_title = (sup["_gender_title"].str.strip() + " " + sup["_desc_title"].str.strip()).str.strip()
@@ -2295,6 +2503,7 @@ def run_transform(
         sup["_title"] = sup["_title"].astype(str).map(_strip_trailing_dashes)
         sup["_title"] = sup["_title"].astype(str).map(_dedupe_gender_phrase)
         sup["_title"] = sup["_title"].astype(str).str.replace(r"\s{2,}", " ", regex=True).str.strip()
+        sup["_title"] = sup["_title"].astype(str).map(_clean_supplier_display_text)
         sup["_title"] = sup["_title"].astype(str).map(lambda x: str(x)[:200].rstrip())
 
     # Rebuild Handle so it uses _gender_final (mens/womens) and de-dupes parts
@@ -2621,6 +2830,7 @@ def run_transform(
     sup["_seo_title"] = sup["_seo_title"].apply(_scrub_nan_token_in_title)
     
     sup["_seo_title"] = sup["_seo_title"].apply(_strip_size_tokens)
+    sup["_seo_title"] = sup["_seo_title"].apply(_clean_supplier_display_text)
 # SEO Description: RESTORE previous behavior
     # Prefix fixe + contenu marque (help data -> SEO Description Brand Part), sinon fallback générique
     def _seo_desc(r):
