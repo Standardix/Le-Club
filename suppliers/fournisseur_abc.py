@@ -654,6 +654,57 @@ def _clean_supplier_display_text(v) -> str:
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip()
 
+def _fix_common_mojibake(v) -> str:
+    """Repair common UTF-8/CP1252 mojibake seen in supplier files.
+
+    Safe general cleanup that can be applied across all suppliers.
+    """
+    if v is None:
+        return ""
+    s = str(v)
+    if not s:
+        return ""
+
+    # Typical mojibake fingerprints worth attempting to repair
+    if any(tok in s for tok in ("Ã", "â", "Â", "�")):
+        try:
+            repaired = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+            if repaired and repaired != s:
+                s = repaired
+        except Exception:
+            pass
+
+    replacements = {
+        "CafÃ©": "Café",
+        "cafÃ©": "café",
+        "Cafâˆšâ©": "Café",
+        "cafâˆšâ©": "café",
+        "Ã©": "é",
+        "Ã¨": "è",
+        "Ãª": "ê",
+        "Ã«": "ë",
+        "Ã ": "à",
+        "Ã¢": "â",
+        "Ã®": "î",
+        "Ã¯": "ï",
+        "Ã´": "ô",
+        "Ã¶": "ö",
+        "Ã¹": "ù",
+        "Ã»": "û",
+        "Ã¼": "ü",
+        "Ã§": "ç",
+        "â€™": "’",
+        "â€“": "–",
+        "â€¢": "•",
+        "Â°": "°",
+        "Â": "",
+    }
+    for bad, good in replacements.items():
+        s = s.replace(bad, good)
+
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
 def _strip_made_in(s: str) -> str:
     t = _norm(s)
     # remove common prefixes like "Made In "
@@ -721,16 +772,18 @@ def _strip_gender_prefix_size(v: str) -> str:
 
 
 def _is_onesize(v: str) -> bool:
-    """Return True if the size represents a One Size / OS variant."""
+    """Return True if the size represents a One Size / OS variant.
+    Includes supplier-specific aliases like U (Unisex/unique size).
+    """
     s = _norm(v).lower()
     if not s:
         return False
     s2 = re.sub(r"[\s\-_]+", "", s)
-    if s2 in {"os", "onesize"}:
+    if s2 in {"os", "onesize", "u"}:
         return True
     if s.startswith("one size"):
         return True
-    if s in {"one-size", "one size", "one_size", "onesize"}:
+    if s in {"one-size", "one size", "one_size", "onesize", "u"}:
         return True
     if s in {"o/s", "o-s"}:
         return True
@@ -1886,14 +1939,14 @@ def run_transform(
     product_col = _first_existing_col(sup, ["Product", "Product Code", "SKU", "sku"])
     color_col = _first_existing_col(sup, ["Vendor Color", "vendor color", "Color", "color", "Colour", "colour", "Color Code", "color code", "colour code and name", "Colour Code and Name", "Color Code and Name", "STYLE COLOR NAME", "Style Color Name", "Style colour name", "Style Color", "Style Colour"])
     size_col = _first_existing_col(sup, ["Size 1","Size1","Size", "size", "Vendor Size1", "vendor size1"])
-    upc_col = _first_existing_col(sup, ["UPC", "UPC Code", "UPC Code.", "UPC Code 1", "UPC Code1", "UPC1", "Variant Barcode", "Barcode", "bar code", "Barcode 1", "Bar code 1", "Bar Code 1", "upc", "upc code"])
+    upc_col = _first_existing_col(sup, ["UPC", "UPC Code", "UPC Code.", "UPC Code 1", "UPC Code1", "UPC1", "Variant Barcode", "Barcode", "bar code", "upc", "upc code"])
     ean_col = _first_existing_col(sup, ["EAN", "EAN Code", "ean", "ean code"])
-    origin_col = _first_existing_col(sup, ["Country of origin", "Country of Origin", "Country Of Origin", "Country Code", "Origin", "Manufacturing Country", "COO", "country of origin", "country of origin ", "country code", "origin", "manufacturing country", "coo"])
-    hs_col = _first_existing_col(sup, ["HS Code", "HTS Code", "hs code", "hts code", "commodity hs", "commodity hts", "Commodity HS", "Commodity HTS", "custome tarif code (no dots)", "custom tarif code (no dots)", "custom tarif code", "Custom tarif code (no dots)", "Custom tarif code", "custom tariff code (no dots)", "custom tariff code", "tariff code", "Harmonisation Code", "Harmonization Code"])
+    origin_col = _first_existing_col(sup, ["Country of origin", "Country of Origin", "Country Of Origin", "Country Code", "Origin", "Manufacturing Country", "Manufacturer Country", "COO", "country of origin", "country of origin ", "country code", "origin", "manufacturing country", "manufacturer country", "coo"])
+    hs_col = _first_existing_col(sup, ["HS Code", "HTS Code", "hs code", "hts code", "commodity hs", "commodity hts", "Commodity HS", "Commodity HTS", "Customs Code", "custome tarif code (no dots)", "custom tarif code (no dots)", "custom tarif code", "Custom tarif code (no dots)", "Custom tarif code", "customs code", "custom tariff code (no dots)", "custom tariff code", "tariff code", "Harmonisation Code", "Harmonization Code"])
     extid_col = _first_existing_col(sup, ["External ID", "ExternalID"])
     msrp_col = _first_existing_col(sup, ["Cad MSRP", "MSRP", "Retail Price (CAD)", "retail price (CAD)", "retail price (cad)"])
     landed_col = _first_existing_col(sup, ["Landed", "landed", "Wholesale Price", "wholesale price", "Wholesale Price (CAD)", "wholesale price (cad)"])
-    grams_col = _first_existing_col(sup, ["Grams", "Weight (g)", "Weight"])
+    grams_col = _first_existing_col(sup, ["Grams", "Weight (g)", "Weight", "Item Weight"])
     gender_col = _first_existing_col(sup, ["Gender", "gender", "Genre", "genre", "Sex", "sex", "Sexe", "sexe"])
 
 
@@ -2030,6 +2083,32 @@ def run_transform(
     sup["_desc_handle"] = sup.apply(lambda r: _strip_reg_for_handle(r["_title_name_raw"]) if r.get("_desc_is_long") and r.get("_title_name_raw") else _strip_reg_for_handle(r["_desc_raw"]), axis=1)
 
     # -----------------------------------------------------
+    # Supplier-specific rule: Café du Cycliste
+    # Build product display name from Name + Product Type for titles,
+    # instead of using the literal marketing description from NuOrder.
+    # Also repair common accent/mojibake issues.
+    # -----------------------------------------------------
+    if vendor_key in ("caféducycliste", "cafeducycliste"):
+        cafe_name_col = _first_existing_col(sup, ["Name"])
+        cafe_type_col = _first_existing_col(sup, ["Product Type"])
+
+        def _cafe_title_source_row(r) -> str:
+            name = _fix_common_mojibake(_norm(r.get(cafe_name_col, ""))) if cafe_name_col else ""
+            ptype = _fix_common_mojibake(_norm(r.get(cafe_type_col, ""))) if cafe_type_col else ""
+            combo = " ".join([x for x in [name, ptype] if str(x).strip()])
+            combo = re.sub(r"\s{2,}", " ", combo).strip()
+            return combo
+
+        cafe_title_source = sup.apply(_cafe_title_source_row, axis=1)
+        mask_has_cafe_title = cafe_title_source.astype(str).str.strip().ne("")
+
+        # Title/SEO/handle should be based on Name + Product Type for Café du Cycliste
+        sup.loc[mask_has_cafe_title, "_desc_title_norm"] = cafe_title_source[mask_has_cafe_title]
+        sup.loc[mask_has_cafe_title, "_desc_raw"] = cafe_title_source[mask_has_cafe_title]
+        sup.loc[mask_has_cafe_title, "_desc_handle"] = cafe_title_source[mask_has_cafe_title].map(_strip_reg_for_handle)
+        sup.loc[mask_has_cafe_title, "_desc_seo"] = cafe_title_source[mask_has_cafe_title].map(_convert_r_to_registered)
+
+    # -----------------------------------------------------
     # Long description rule:
     # If the SOURCE description text is > 200 chars, move it to Body (HTML)
     # and build Title from Style Name / Name instead of the long description.
@@ -2045,6 +2124,28 @@ def run_transform(
     sup["_desc_title_norm"] = sup["_desc_raw"].copy()
     if title_name_col:
         sup["_title_name_raw"] = _series_str_clean(sup[title_name_col]).map(_clean_supplier_display_text).map(_norm)
+
+    for _c in ["_body_html", "_desc_source", "_desc_raw", "_desc_title_norm", "_desc_seo", "_title_name_raw"]:
+        if _c in sup.columns:
+            sup[_c] = _series_str_clean(sup[_c]).map(_fix_common_mojibake)
+
+    # Re-apply Café du Cycliste title source AFTER the generic description/body cleanup,
+    # otherwise the description column can overwrite the supplier-specific naming rule.
+    # Desired display name for this supplier: current Women's logic + Name + Product Type.
+    if vendor_key in ("caféducycliste", "cafeducycliste"):
+        cafe_name_col = _first_existing_col(sup, ["Name"])
+        cafe_type_col = _first_existing_col(sup, ["Product Type"])
+
+        def _cafe_title_source_row_after_cleanup(r) -> str:
+            name = _fix_common_mojibake(_clean_supplier_display_text(_norm(r.get(cafe_name_col, "")))) if cafe_name_col else ""
+            ptype = _fix_common_mojibake(_clean_supplier_display_text(_norm(r.get(cafe_type_col, "")))) if cafe_type_col else ""
+            combo = " ".join([x for x in [name, ptype] if str(x).strip()])
+            combo = re.sub(r"\s{2,}", " ", combo).strip()
+            return combo
+
+        cafe_title_source = sup.apply(_cafe_title_source_row_after_cleanup, axis=1)
+        mask_has_cafe_title = cafe_title_source.astype(str).str.strip().ne("")
+        sup.loc[mask_has_cafe_title, "_desc_title_norm"] = cafe_title_source[mask_has_cafe_title]
     # Color / Size input
     sup["_color_raw"] = _series_str_clean(sup[color_col]).map(_clean_color_label).map(_norm) if color_col else ""
     sup["_size_raw"] = _series_str_clean(sup[size_col]).map(_norm) if size_col else ""
@@ -2921,9 +3022,14 @@ def run_transform(
     def _make_variant_sku(r):
         # Identify brand/vendor (case-insensitive)
         brand_key = _norm_key(r.get("_brand_choice", "")) or _norm_key(r.get("_vendor", ""))
-                # Size doit provenir de 'Variant Metafield: mm-google-shopping.size' (via _size_std)
-        size_raw = _strip_gender_prefix_size(r.get("_size_std", ""))
-        size = _clean_hyphens_sku(size_raw)
+        # Size must follow the same logic as the exported Google size metafield.
+        # When Option1 is switched to Title / Default Title (OS, U, single-variant no true size),
+        # the SKU must not append any trailing size token.
+        if _norm(r.get("_opt1_name", "")).lower() == "title":
+            size = ""
+        else:
+            size_raw = _strip_gender_prefix_size(r.get("_size_std", ""))
+            size = _clean_hyphens_sku(size_raw)
         # Ne jamais utiliser 'Default Title' comme taille
         if _norm_key(size) in ("default title", "default", "default value"):
             size = ""
@@ -2938,7 +3044,9 @@ def run_transform(
 
         if brand_key in ("cafe du cycliste", "café du cycliste"):
             base = _clean_hyphens_sku(r.get("_sku_fallback", ""))
-            return f"{base}-{size}" if base and size else ""
+            if base and size:
+                return f"{base}-{size}"
+            return base if base else ""
 
         # Other suppliers: first non-empty among SKU / SKU 1 / SKU1 (already resolved into _sku_fallback)
         base = _clean_hyphens_sku(r.get("_sku_fallback", ""))
@@ -2996,7 +3104,10 @@ def run_transform(
 
     out["Metafield: my_fields.colour [single_line_text_field]"] = sup["_color_std"]
     out["Metafield: mm-google-shopping.color"] = sup["_color_std"]
-    out["Variant Metafield: mm-google-shopping.size"] = sup["_size_std"].map(_strip_gender_prefix_size)
+    out["Variant Metafield: mm-google-shopping.size"] = sup.apply(
+        lambda r: "" if _norm(r.get("_opt1_name", "")).lower() == "title" else _strip_gender_prefix_size(r.get("_size_std", "")),
+        axis=1,
+    )
 
     out["Metafield: mm-google-shopping.size_system"] = "US"
     out["Metafield: mm-google-shopping.condition"] = "new"
